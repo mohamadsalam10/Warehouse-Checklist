@@ -428,7 +428,8 @@ app.get('/api/reports/:week/download', admin, wrap(async (req, res) => {
 
 /* ---------- Static app ---------- */
 app.get('/healthz', (req, res) => res.json({ ok: true }));
-app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', maxAge: '1h' }));
+// no-cache: browsers check for a newer version on every load, so updates show up straight after a deploy
+app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html', etag: true, lastModified: true, setHeaders: res => res.setHeader('Cache-Control', 'no-cache') }));
 app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 /* ---------- Errors ---------- */
