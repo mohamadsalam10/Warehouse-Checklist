@@ -29,7 +29,7 @@ Any address at the verified domain can be the sender, e.g. `facilities@storage.a
 
 ### 3. Create the app on Render
 1. Render dashboard > **New > Blueprint** > choose your repository.
-2. Render reads `render.yaml` and creates the web service and the database.
+2. Render reads `render.yaml` and creates the web service and the database, both on free plans.
 3. When asked, paste the Resend API key into `RESEND_API_KEY`.
 4. Click **Apply**. The first deploy takes a few minutes.
 
@@ -41,11 +41,26 @@ Any address at the verified domain can be the sender, e.g. `facilities@storage.a
    - Under **Email > Sender**, enter the sender name and `facilities@storage.ae`, save, and click **Send test email**.
    - Under **Users**, add each supervisor with a temporary password and share it with them.
 
-### Costs and limits on Render
-- **Database:** the blueprint uses the `basic-256mb` plan (about $6/month). Free Render databases are deleted after 30 days.
-- **Web service:** free works, but it sleeps after 15 minutes idle, so the first visit takes about a minute to wake.
-  Upgrade to **Starter** (about $7/month) to keep it always on.
-- **Photos:** resized to about 200 KB on the phone before upload and stored in the database. 1 GB is roughly 5,000 photos.
+### Free plan limits on Render
+The blueprint uses Render's free plans, so it costs nothing, with these limits:
+- **The free database is deleted 30 days after it's created.** Before then, either upgrade it
+  (Render > facility-check-db > Upgrade, about $6/month, data kept) or move the app to another server
+  (see "Moving to another server" below).
+- **The web service sleeps after 15 minutes idle,** so the first visit takes about a minute to wake.
+- **Email must use Resend;** free web services block SMTP.
+- **One free database per Render workspace.** If you already have one, set `plan: basic-256mb` in render.yaml.
+
+Render may still ask for a card to verify your account. It places a $1 hold that is cancelled straight away.
+
+### Moving to another server
+All data lives in the Postgres database: inspections, photos, users and settings. To keep it:
+1. In Render, open facility-check-db > Info and copy the **External Database URL**.
+2. On any computer with Postgres tools, run:
+   `pg_dump "EXTERNAL_DATABASE_URL" -Fc -f facility-check.dump`
+3. On the new server, create a Postgres database and run:
+   `pg_restore -d "NEW_DATABASE_URL" --no-owner facility-check.dump`
+4. Deploy the app there with `DATABASE_URL` pointing to the new database, and the same `SESSION_SECRET`
+   (copy it from Render > facility-check > Environment) so email photo links keep working.
 
 ---
 

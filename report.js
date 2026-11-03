@@ -42,8 +42,9 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
     iss.forEach(x => {
       html += `<div style="border-top:1px solid #E6E6E6;padding:10px 0">
         <span style="${sevStyle[x.a.sev || 'major']};font-size:10px;font-weight:bold;letter-spacing:1px;text-transform:uppercase;padding:2px 6px">${cap(x.a.sev || 'major')}</span>
-        <b>${esc(x.it.text)}</b> <span style="color:#6B6B6B;font-size:12px">${esc(x.sec.title)}</span>
+        <b>${esc(x.it.text)}</b> <span style="color:#6B6B6B;font-size:12px">${esc([x.sec.title, x.it.group].filter(Boolean).join(' / '))}${x.it.category ? ' | ' + esc(x.it.category) : ''}</span>
         ${x.a.note ? `<div style="margin-top:4px;color:#2B2B2B">${esc(x.a.note)}</div>` : ''}
+        ${x.it.action ? `<div style="margin-top:4px;color:#6B6B6B;font-size:12px"><b>Corrective action:</b> ${esc(x.it.action)}</div>` : ''}
         ${(x.a.photos || []).length ? `<div style="margin-top:6px">${x.a.photos.map(p => `<a href="${photoUrl(p)}"><img src="${photoUrl(p)}" width="120" height="120" alt="Photo: ${esc(x.it.text)}" style="width:120px;height:120px;object-fit:cover;border:1px solid #E6E6E6;margin:0 6px 6px 0"></a>`).join('')}</div>` : ''}
       </div>`;
     });
@@ -61,7 +62,7 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
     if (!i || i.status !== 'submitted') { lines.push(`${w.name}: not submitted`, ''); return; }
     const st = stats(i);
     lines.push(`${w.name}: score ${scoreTxt(st.score)}, ${pl(st.fail, 'issue')}${st.critical ? ` (${st.critical} critical)` : ''}`);
-    issuesOf(i).forEach(x => lines.push(`  - [${cap(x.a.sev || 'major')}] ${x.it.text}${x.a.note ? ': ' + x.a.note : ''}`));
+    issuesOf(i).forEach(x => { lines.push(`  - [${cap(x.a.sev || 'major')}] ${x.sec.title}${x.it.group ? ' / ' + x.it.group : ''}: ${x.it.text}${x.a.note ? ': ' + x.a.note : ''}`); if (x.it.action) lines.push(`    Corrective action: ${x.it.action}`); });
     lines.push('');
   });
   lines.push(attachmentNote ? 'The full report with all photos is attached.' : '', appUrl ? `Open the report: ${appUrl}/#reports/${week}` : '', '', 'Thanks,', 'Facility Check');
@@ -102,7 +103,7 @@ function buildReportFile({ week, rows, photoData }) {
       <p class="m">${st.pass} passed, ${st.fail} failed, ${st.na} not applicable. Inspected by ${esc(i.submittedByName || '')} on ${fmtDate(i.submittedAt)}.</p>
       <table class="bars">${st.bySec.map(s => `<tr><td class="bl">${esc(s.title)}</td><td><div class="tr"><div style="width:${s.score || 0}%;background:${barCol(s.score)}"></div></div></td><td class="r bv">${scoreTxt(s.score)}</td></tr>`).join('')}</table>
       <h3>Issues found (${iss.length})</h3>
-      ${iss.length ? iss.map(x => `<div class="iss"><span class="tag" style="${sevStyle[x.a.sev || 'major']}">${cap(x.a.sev || 'major')}</span> <b>${esc(x.it.text)}</b> <span class="m sm">${esc(x.sec.title)}</span>${x.a.note ? `<div class="nt">${esc(x.a.note)}</div>` : ''}<div>${(x.a.photos || []).map(p => img(p, x.it.text)).join('')}</div></div>`).join('') : '<p><b>No issues found.</b></p>'}
+      ${iss.length ? iss.map(x => `<div class="iss"><span class="tag" style="${sevStyle[x.a.sev || 'major']}">${cap(x.a.sev || 'major')}</span> <b>${esc(x.it.text)}</b> <span class="m sm">${esc([x.sec.title, x.it.group].filter(Boolean).join(' / '))}${x.it.category ? ' | ' + esc(x.it.category) : ''}</span>${x.a.note ? `<div class="nt">${esc(x.a.note)}</div>` : ''}${x.it.action ? `<div class="m sm" style="margin-top:3px"><b>Corrective action:</b> ${esc(x.it.action)}</div>` : ''}<div>${(x.a.photos || []).map(p => img(p, x.it.text)).join('')}</div></div>`).join('') : '<p><b>No issues found.</b></p>'}
       ${others.length ? `<h3>Other photos</h3><div>${others.map(o => `<figure>${img(o.id, o.it.text)}<figcaption>${esc(o.it.text)}</figcaption></figure>`).join('')}</div>` : ''}
     </div>`;
   });

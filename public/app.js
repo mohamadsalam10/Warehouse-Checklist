@@ -12,7 +12,7 @@ const S = {
   config: null, sender: null, mail: null, users: null,
   week: THIS_WEEK, inspections: {}, weekLoaded: false, report: null, mailConfigured: true,
   tab: 'inspect', draft: null, itemMap: {}, collapsed: {}, expanded: {}, uploading: {},
-  editWh: null, armed: null, readOnly: false, stale: false, sending: false
+  editWh: null, armed: null, edOpen: {}, importPreview: null, readOnly: false, stale: false, sending: false
 };
 
 /* ---------- API ---------- */
@@ -268,7 +268,11 @@ function sectionHTML(sec, ro, idx) {
   return `<section class="sec" data-sec="${esc(sec.id)}">
     <button class="sec-head" data-toggle="${esc(sec.id)}" aria-expanded="${open}"><span class="sec-title"><span class="eyebrow dash">Section ${String(idx + 1).padStart(2, '0')}</span><h2>${esc(sec.title)}</h2></span><span class="sec-right"><span class="sec-count" data-count="${esc(sec.id)}"></span><span class="chev" aria-hidden="true">▾</span></span></button>
     <div class="sec-body">${ro ? '' : `<div class="sec-tools"><button class="link-btn" data-allpass="${esc(sec.id)}">Mark remaining as Pass</button></div>`}
-    ${sec.items.map(it => itemHTML(it, ro)).join('')}</div></section>`;
+    ${itemsWithGroups(sec, ro)}</div></section>`;
+}
+function itemsWithGroups(sec, ro) {
+  let last = null;
+  return sec.items.map(it => { const g = it.group || ''; const h = g && g !== last ? `<div class="grp">${esc(g)}</div>` : ''; last = g; return h + itemHTML(it, ro); }).join('');
 }
 function itemHTML(it, ro) {
   const a = S.draft.answers[it.id] || {};
@@ -278,6 +282,7 @@ function itemHTML(it, ro) {
   if (show) {
     extra = `<div class="extra">
       ${s === 'fail' ? `<div class="sev" role="group" aria-label="Severity"><span class="sev-label">Severity</span>${SEVS.map(v => `<button type="button" class="chip ${v}" data-sev="${v}" aria-pressed="${(a.sev || 'major') === v}" ${ro ? 'disabled' : ''}>${cap(v)}</button>`).join('')}</div>` : ''}
+      ${s === 'fail' && (it.action || it.category) ? `<p class="fix">${it.action ? `<span class="fix-l">Corrective action</span>${esc(it.action)}` : ''}${it.category ? ` <span class="tag minor">${esc(it.category)}</span>` : ''}</p>` : ''}
       ${ro && !(a.note || '').trim() ? '' : `<textarea data-note rows="2" aria-label="Note for: ${esc(it.text)}" placeholder="${s === 'fail' ? 'What’s wrong and what action is needed? (required)' : 'Note (optional)'}" ${ro ? 'readonly' : ''}>${esc(a.note || '')}</textarea>`}
       <div class="photos">${photos.map(id => `<div class="ph"><img src="/api/photos/${esc(id)}" alt="Photo for ${esc(it.text)}" loading="lazy" data-view="${esc(id)}">${ro ? '' : `<button class="ph-x" data-rmphoto="${esc(id)}" aria-label="Remove photo">×</button>`}</div>`).join('')}
       ${S.uploading[it.id] ? `<div class="ph up">Uploading…</div>` : ''}
@@ -433,8 +438,9 @@ function renderReports() {
       <p class="rep-meta">${st.pass} passed, ${st.fail} failed, ${st.na} not applicable. Inspected by ${esc(i.submittedByName || '')} on ${fmtDate(i.submittedAt)}.</p>
       <div class="sec-scores">${st.bySec.map(s => `<span>${esc(s.title)}</span><div class="bar"><span class="${scoreClass(s.score)}" style="width:${s.score == null ? 0 : s.score}%"></span></div><span>${s.score == null ? 'N/A' : s.score + '%'}</span>`).join('')}</div>
       <h4>Issues found (${iss.length})</h4>
-      ${iss.length ? '<ul class="issues">' + iss.map(x => `<li><div class="issue-top"><span class="tag ${x.a.sev || 'major'}">${cap(x.a.sev || 'major')}</span><strong>${esc(x.it.text)}</strong><span class="issue-sec">${esc(x.sec.title)}</span></div>
+      ${iss.length ? '<ul class="issues">' + iss.map(x => `<li><div class="issue-top"><span class="tag ${x.a.sev || 'major'}">${cap(x.a.sev || 'major')}</span><strong>${esc(x.it.text)}</strong><span class="issue-sec">${esc([x.sec.title, x.it.group].filter(Boolean).join(' / '))}${x.it.category ? ' | ' + esc(x.it.category) : ''}</span></div>
         ${x.a.note ? `<p class="issue-note">${esc(x.a.note)}</p>` : ''}
+        ${x.it.action ? `<p class="issue-note muted" style="font-size:.875rem"><strong>Corrective action:</strong> ${esc(x.it.action)}</p>` : ''}
         ${x.a.photos && x.a.photos.length ? `<div class="photos" style="margin-top:8px">${x.a.photos.map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="Photo: ${esc(x.it.text)}" loading="lazy" data-view="${esc(p)}"></div>`).join('')}</div>` : ''}</li>`).join('') + '</ul>' : '<p class="ok-note">No issues found.</p>'}
       ${others.length ? `<h4>Other photos</h4><div class="gallery">${others.map(o => `<figure><img src="/api/photos/${esc(o.id)}" alt="Photo: ${esc(o.it.text)}" loading="lazy" data-view="${esc(o.id)}"><figcaption>${esc(o.it.text)}</figcaption></figure>`).join('')}</div>` : ''}
     </article>`;
@@ -515,19 +521,143 @@ function renderSetup() {
       ${S.resetFor === u.id ? `<div class="grid2" style="margin-top:10px;max-width:560px"><input type="text" id="rPw" placeholder="New temporary password" aria-label="New password"><div><button class="btn primary" data-upwsave="${u.id}">Set password</button></div></div>` : ''}</li>`).join('') + '</ul>'}
   </section>`;
 
-  html += `<section class="panel"><span class="eyebrow dash">Checklist</span><h2>Checklist points</h2><p class="hint">Edits apply to inspections started after you make them. Inspections already started keep the checklist they began with.</p>`;
-  if (!secs.length) html += `<div class="empty" style="margin-bottom:12px"><h2>Start with the standard checklist</h2><p>${STANDARD.reduce((n, s) => n + s[1].length, 0)} points across security, fire safety, health and safety, racking, cleanliness, organisation, records and utilities. You can edit any of it.</p><button class="btn primary" data-std>Use standard checklist</button></div>`;
-  html += secs.map((sec, si) => `<div class="ed-sec">
-      <span class="eyebrow">Section ${String(si + 1).padStart(2, '0')}</span>
+  const nPoints = secs.reduce((n, x) => n + x.items.length, 0);
+  html += `<section class="panel" id="clPanel"><span class="eyebrow dash">Checklist</span><h2>Checklist points</h2>
+    <p class="hint">Add, edit, reorder or remove points, or import them from Excel. Write each point as what good looks like (“Floor free of dust”), so Pass means OK. Changes apply to inspections started after you make them; inspections already started keep their checklist.</p>
+    <div class="send-actions"><label class="btn primary"><input class="vh" type="file" accept=".xlsx,.xls,.csv" data-import aria-label="Import checklist from Excel">Import from Excel</label>
+      ${secs.length ? '' : '<button class="btn" data-std>Use standard checklist</button>'}
+      <span class="muted" style="align-self:center;font-size:.875rem">${nPoints} point${nPoints === 1 ? '' : 's'} in ${secs.length} section${secs.length === 1 ? '' : 's'}</span></div>
+    ${S.importPreview ? importPreviewHTML() : ''}`;
+  html += secs.map((sec, si) => {
+    let lastG = null;
+    return `<div class="ed-sec">
+      <span class="eyebrow">Section ${String(si + 1).padStart(2, '0')} | ${sec.items.length} point${sec.items.length === 1 ? '' : 's'}</span>
       <div class="ed-sec-head"><input type="text" data-sectitle="${esc(sec.id)}" value="${esc(sec.title)}" aria-label="Section title">
       <button class="icon-btn" data-mvsec="${si}" data-dir="-1" aria-label="Move section up" ${si === 0 ? 'disabled' : ''}>↑</button>
       <button class="icon-btn" data-mvsec="${si}" data-dir="1" aria-label="Move section down" ${si === secs.length - 1 ? 'disabled' : ''}>↓</button>
-      <button class="icon-btn ${S.armed === 's' + sec.id ? 'armed' : ''}" data-delsec="${esc(sec.id)}" aria-label="Delete section" title="${S.armed === 's' + sec.id ? 'Click again to delete' : 'Delete section'}">×</button></div>
-      ${sec.items.map(it => `<div class="ed-item"><input type="text" data-itemtext="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.text)}" aria-label="Checklist point"><button class="icon-btn" data-delitem="${esc(it.id)}" data-of="${esc(sec.id)}" aria-label="Delete point">×</button></div>`).join('')}
-      <button class="link-btn" data-additem="${esc(sec.id)}">+ Add point</button></div>`).join('');
+      <button class="icon-btn ${S.armed === 's' + sec.id ? 'armed' : ''}" data-delsec="${esc(sec.id)}" aria-label="${S.armed === 's' + sec.id ? 'Click again to delete this section' : 'Delete section'}" title="${S.armed === 's' + sec.id ? 'Click again to delete' : 'Delete section'}">×</button></div>
+      ${sec.items.map((it, ii) => {
+        const g = it.group || '';
+        const gh = g && g !== lastG ? `<div class="ed-grp">${esc(g)}</div>` : '';
+        lastG = g;
+        const open = S.edOpen[it.id];
+        const meta = [it.category, it.action].filter(Boolean).join(' | ');
+        return gh + `<div class="ed-item"><input type="text" data-itemtext="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.text)}" placeholder="Point, e.g. Floor free of dust" aria-label="Checklist point">
+          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-dir="-1" aria-label="Move point up" ${ii === 0 ? 'disabled' : ''}>↑</button>
+          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-dir="1" aria-label="Move point down" ${ii === sec.items.length - 1 ? 'disabled' : ''}>↓</button>
+          <button class="icon-btn ${open ? 'on' : ''}" data-itemmore="${esc(it.id)}" aria-expanded="${!!open}" aria-label="Group, category and corrective action" title="Group, category and corrective action">⋯</button>
+          <button class="icon-btn ${S.armed === 'i' + it.id ? 'armed' : ''}" data-delitem="${esc(it.id)}" data-of="${esc(sec.id)}" aria-label="${S.armed === 'i' + it.id ? 'Click again to remove this point' : 'Remove point'}" title="${S.armed === 'i' + it.id ? 'Click again to remove' : 'Remove point'}">×</button></div>
+          ${open ? `<div class="ed-more">
+            <input type="text" data-itemfield="group" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.group || '')}" placeholder="Group (sub-heading), optional" aria-label="Group">
+            <input type="text" data-itemfield="category" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.category || '')}" placeholder="Category, optional" aria-label="Category">
+            <input type="text" data-itemfield="action" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.action || '')}" placeholder="Corrective action shown when it fails, optional" aria-label="Corrective action"></div>`
+          : meta ? `<div class="ed-meta">${esc(meta)}</div>` : ''}`;
+      }).join('')}
+      <button class="link-btn" data-additem="${esc(sec.id)}">+ Add point</button></div>`;
+  }).join('');
   html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px"><button class="btn" data-addsec>+ Add section</button>
     ${secs.length ? `<button class="btn ghost ${S.armed === 'std' ? 'danger armed' : ''}" data-std>${S.armed === 'std' ? 'Confirm: replace with standard' : 'Restore standard checklist'}</button>` : ''}</div></section>`;
   main.innerHTML = html;
+}
+/* ---------- Checklist import (Excel / CSV) ---------- */
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const el = document.createElement('script');
+    el.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    el.onload = res; el.onerror = () => rej(new Error('Couldn’t load the Excel reader. Check your connection and try again.'));
+    document.head.appendChild(el);
+  });
+}
+const MARK = /^[\s\u2705\u2714\u2611\u2713\u25AA\u25CF\u2022*#>\-–]+/u;
+function parseChecklist(rows) {
+  const norm = v => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  let hi = -1, col = { point: 0 };
+  for (let i = 0; i < Math.min(rows.length, 30); i++) {
+    const r = rows[i] || [];
+    const idx = r.findIndex(v => /^(checkpoints?|check ?points?|points?|items?|checks?|questions?)$/i.test(norm(v)));
+    if (idx < 0) continue;
+    hi = i; col = { point: idx };
+    r.forEach((v, j) => {
+      const t = norm(v).toLowerCase();
+      if (/^(area|section|zone|location)$/.test(t)) col.area = j;
+      else if (/^(group|sub ?section|sub ?heading|sub-?area)$/.test(t)) col.group = j;
+      else if (/^(category|cause|root cause|type)$/.test(t)) col.category = j;
+      else if (/^(solution|action|corrective action|recommended action|fix|remedy)$/.test(t)) col.action = j;
+    });
+    break;
+  }
+  const secs = [], byTitle = {}, seen = {}, problem = [], dupes = [];
+  const getSec = t => { const k = (t || 'General').toLowerCase(); if (!byTitle[k]) { byTitle[k] = { id: uid(), title: t || 'General', items: [] }; secs.push(byTitle[k]); } return byTitle[k]; };
+  let area = '', group = '';
+  for (let i = hi + 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const raw = norm(r[col.point]);
+    if (!raw) continue;
+    const others = r.some((v, j) => j !== col.point && norm(v) !== '');
+    if (/^(survey|score|total|overall)\b/i.test(raw) || (/\bscore\b/i.test(raw) && r.some(v => typeof v === 'number'))) continue;
+    if (col.area == null && !others) {
+      // A row with only a title: "✅ Something" is a group, plain text is an area
+      if (MARK.test(raw)) group = raw.replace(MARK, '').trim(); else { area = raw.replace(MARK, '').trim(); group = ''; }
+      continue;
+    }
+    if (col.area != null && norm(r[col.area])) { const na = norm(r[col.area]); if (na !== area) group = ''; area = na; }
+    if (col.group != null && norm(r[col.group])) group = norm(r[col.group]);
+    const text = raw.replace(MARK, '').trim().slice(0, 300);
+    const it = { id: uid(), text };
+    if (group) it.group = group.slice(0, 80);
+    if (col.category != null && norm(r[col.category]) && typeof r[col.category] !== 'number' && typeof r[col.category] !== 'boolean') it.category = norm(r[col.category]).slice(0, 60);
+    if (col.action != null && norm(r[col.action]) && typeof r[col.action] !== 'boolean') it.action = norm(r[col.action]).slice(0, 300);
+    const sec = getSec(area);
+    const key = sec.title.toLowerCase() + '|' + text.toLowerCase();
+    if (seen[key]) { dupes.push(`${sec.title}: ${text}`); continue; }
+    seen[key] = true;
+    sec.items.push(it);
+    if (!/^no\b|free of|\bclean\b|working|stocked|available|fresh|clear\b|closed|kept|tidy/i.test(text) && /(\bnot\b|\bhas\b|\bhave\b|shows?\b|dirty|dusty|missing|blocked|faulty|exposed|buildup|pooling|left behind|left out|stained|smudge|cluttered|unpleasant)/i.test(text)) problem.push(text);
+  }
+  const sections = secs.filter(x => x.items.length);
+  return { sections, count: sections.reduce((n, x) => n + x.items.length, 0), problem, dupes };
+}
+async function importFile(file) {
+  try {
+    toast('Reading ' + file.name + '…');
+    await loadXLSX();
+    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+    const name = wb.SheetNames.find(n => /checklist/i.test(n)) || wb.SheetNames[0];
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: true, blankrows: false });
+    const r = parseChecklist(rows);
+    if (!r.count) throw new Error('No checklist points found in that file. Put one point per row, with a “Checkpoint” column header.');
+    S.importPreview = Object.assign(r, { fileName: file.name });
+    renderSetup();
+    const el = document.getElementById('impPreview'); el && el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  } catch (e) { toast(e.message || 'Couldn’t read that file.'); }
+}
+function importPreviewHTML() {
+  const p = S.importPreview, has = (S.config.sections || []).length;
+  return `<div class="imp" id="impPreview"><span class="eyebrow dash">Import preview</span>
+    <h3 style="font-size:1.25rem;margin:6px 0 4px">${esc(p.fileName)}: ${p.count} points in ${p.sections.length} section${p.sections.length === 1 ? '' : 's'}</h3>
+    <ul class="imp-list">${p.sections.map(x => { const groups = new Set(x.items.map(i => i.group).filter(Boolean)).size; return `<li><strong>${esc(x.title)}</strong><span class="muted">${x.items.length} point${x.items.length === 1 ? '' : 's'}${groups ? `, ${groups} group${groups === 1 ? '' : 's'}` : ''}</span></li>`; }).join('')}</ul>
+    ${p.problem.length ? `<div class="status-box wait"><strong>${p.problem.length} point${p.problem.length === 1 ? ' looks' : 's look'} like ${p.problem.length === 1 ? 'it describes' : 'they describe'} a problem.</strong><p>For example: “${esc(p.problem[0])}”. In the app, Pass means the point is OK, so these read the wrong way round. Write them as what good looks like (“Floor free of dust” instead of “Floor has dust”). You can import now and edit them below.</p></div>` : ''}
+    ${p.dupes.length ? `<div class="status-box"><strong>${p.dupes.length} duplicate${p.dupes.length === 1 ? '' : 's'} skipped</strong><p>${p.dupes.slice(0, 4).map(esc).join('<br>')}${p.dupes.length > 4 ? '<br>…' : ''}</p></div>` : ''}
+    <div class="send-actions" style="margin:12px 0 0">
+      <button class="btn primary ${S.armed === 'impReplace' ? 'armed' : ''}" data-impreplace>${!has ? 'Import checklist' : S.armed === 'impReplace' ? 'Confirm: replace current checklist' : 'Replace current checklist'}</button>
+      ${has ? '<button class="btn" data-impadd>Add to current checklist</button>' : ''}
+      <button class="btn ghost" data-impcancel>Cancel</button></div></div>`;
+}
+function applyImport(mode) {
+  const p = S.importPreview; if (!p) return;
+  if (mode === 'replace') S.config.sections = p.sections;
+  else {
+    p.sections.forEach(ns => {
+      const ex = S.config.sections.find(x => x.title.toLowerCase() === ns.title.toLowerCase());
+      if (!ex) { S.config.sections.push(ns); return; }
+      const have = new Set(ex.items.map(i => i.text.toLowerCase()));
+      ns.items.forEach(i => { if (!have.has(i.text.toLowerCase())) ex.items.push(i); });
+    });
+  }
+  S.importPreview = null; S.armed = null;
+  saveConfig(0); renderSetup();
+  toast(mode === 'replace' ? `Checklist replaced: ${p.count} points imported` : 'Points added to the checklist');
 }
 function arm(key) { S.armed = key; clearTimeout(S.armT); S.armT = setTimeout(() => { if (S.armed === key) { S.armed = null; if (S.tab === 'setup' && !S.draft) renderSetup(); } }, 4000); }
 const isEmail = e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
@@ -630,7 +760,7 @@ main.addEventListener('click', e => {
   }
   if ('std' in ds) {
     if ((S.config.sections || []).length && S.armed !== 'std') { arm('std'); renderSetup(); return; }
-    S.config.sections = standardSections(); S.armed = null; saveConfig(0); renderSetup(); toast('Standard checklist loaded'); return;
+    S.config.sections = standardSections(); S.armed = null; S.importPreview = null; saveConfig(0); renderSetup(); toast('Standard checklist loaded'); return;
   }
   if ('addsec' in ds) { const s = { id: uid(), title: 'New section', items: [{ id: uid(), text: '' }] }; S.config.sections.push(s); saveConfig(); renderSetup(); const f = main.querySelector(`[data-sectitle="${s.id}"]`); f && (f.focus(), f.select()); return; }
   if (ds.mvsec != null) { const i = +ds.mvsec, j = i + (+ds.dir), a = S.config.sections; if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; saveConfig(); renderSetup(); return; }
@@ -638,8 +768,16 @@ main.addEventListener('click', e => {
     if (S.armed !== 's' + ds.delsec) { arm('s' + ds.delsec); renderSetup(); return; }
     S.config.sections = S.config.sections.filter(s => s.id !== ds.delsec); S.armed = null; saveConfig(0); renderSetup(); return;
   }
-  if (ds.additem) { const sec = S.config.sections.find(s => s.id === ds.additem); const it = { id: uid(), text: '' }; sec.items.push(it); saveConfig(); renderSetup(); const f = main.querySelector(`[data-itemtext="${it.id}"]`); f && f.focus(); return; }
-  if (ds.delitem) { const sec = S.config.sections.find(s => s.id === ds.of); sec.items = sec.items.filter(i => i.id !== ds.delitem); saveConfig(); renderSetup(); return; }
+  if ('impreplace' in ds) { if ((S.config.sections || []).length && S.armed !== 'impReplace') { arm('impReplace'); renderSetup(); return; } return applyImport('replace'); }
+  if ('impadd' in ds) return applyImport('add');
+  if ('impcancel' in ds) { S.importPreview = null; renderSetup(); return; }
+  if (ds.itemmore) { S.edOpen[ds.itemmore] = !S.edOpen[ds.itemmore]; renderSetup(); const f = main.querySelector(`[data-itemfield="group"][data-id="${CSS.escape(ds.itemmore)}"]`); f && f.focus(); return; }
+  if (ds.mvitem != null) { const sec = S.config.sections.find(x => x.id === ds.of), i = +ds.mvitem, j = i + (+ds.dir); if (!sec || j < 0 || j >= sec.items.length) return; [sec.items[i], sec.items[j]] = [sec.items[j], sec.items[i]]; saveConfig(); renderSetup(); const f = main.querySelector(`[data-mvitem="${j}"][data-of="${CSS.escape(ds.of)}"][data-dir="${ds.dir}"]`); f && !f.disabled && f.focus(); return; }
+  if (ds.additem) { const sec = S.config.sections.find(s => s.id === ds.additem); const last = sec.items[sec.items.length - 1]; const it = { id: uid(), text: '' }; if (last && last.group) it.group = last.group; sec.items.push(it); saveConfig(); renderSetup(); const f = main.querySelector(`[data-itemtext="${it.id}"]`); f && f.focus(); return; }
+  if (ds.delitem) {
+    if (S.armed !== 'i' + ds.delitem) { arm('i' + ds.delitem); renderSetup(); return; }
+    const sec = S.config.sections.find(s => s.id === ds.of); sec.items = sec.items.filter(i => i.id !== ds.delitem); S.armed = null; saveConfig(); renderSetup(); toast('Point removed'); return;
+  }
 });
 document.body.addEventListener('click', e => {
   const t = e.target.closest('.cl-bar button'); if (!t) return;
@@ -655,10 +793,12 @@ main.addEventListener('input', e => {
   }
   if (ds.sectitle) { const s = S.config.sections.find(x => x.id === ds.sectitle); s.title = t.value; saveConfig(); return; }
   if (ds.itemtext) { const s = S.config.sections.find(x => x.id === ds.of); const it = s.items.find(x => x.id === ds.itemtext); it.text = t.value; saveConfig(); return; }
+  if (ds.itemfield) { const s = S.config.sections.find(x => x.id === ds.of); const it = s && s.items.find(x => x.id === ds.id); if (!it) return; const v = t.value; if (v.trim()) it[ds.itemfield] = v; else delete it[ds.itemfield]; saveConfig(); return; }
 });
 main.addEventListener('change', e => {
   const t = e.target, ds = t.dataset;
   if ('photo' in ds) { const id = t.closest('[data-item]').dataset.item; addPhotos(id, [...t.files]); t.value = ''; return; }
+  if ('import' in ds) { const f = t.files && t.files[0]; t.value = ''; if (f) importFile(f); return; }
   if (ds.activewh) { const w = S.config.warehouses.find(x => x.id === ds.activewh); w.active = t.checked; saveConfig(0); renderSetup(); return; }
   if (ds.scopeall) { const m = S.config.managers.find(x => x.id === ds.scopeall); m.scope = t.checked ? 'all' : []; saveConfig(0); renderSetup(); return; }
   if (ds.scope) { const m = S.config.managers.find(x => x.id === ds.scope); const set = new Set(m.scope); t.checked ? set.add(t.value) : set.delete(t.value); m.scope = [...set]; saveConfig(0); return; }

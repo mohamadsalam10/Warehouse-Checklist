@@ -61,7 +61,7 @@ async function startSession(req, res, userId) {
 const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active });
 
 /* ---------- Session + CSRF ---------- */
-app.use('/api', express.json({ limit: '2mb' }));
+app.use('/api', express.json({ limit: '4mb' }));
 app.use('/api', wrap(async (req, res, next) => {
   // Mutating API calls must carry the X-FC header (blocks cross-site form posts).
   if (req.method !== 'GET' && req.headers['x-fc'] !== '1') fail(403, 'Request blocked.');
@@ -184,8 +184,8 @@ function cleanConfig(c) {
   const whIds = new Set(warehouses.map(w => w.id));
   const managers = (Array.isArray(c.managers) ? c.managers : []).filter(m => idOk(m.id) && str(m.name) && isEmail(m.email)).slice(0, 200)
     .map(m => ({ id: m.id, name: str(m.name, 120), email: str(m.email, 200), scope: Array.isArray(m.scope) ? m.scope.filter(x => whIds.has(x)) : 'all' }));
-  const sections = (Array.isArray(c.sections) ? c.sections : []).filter(s => idOk(s.id)).slice(0, 50)
-    .map(s => ({ id: s.id, title: str(s.title, 120) || 'Untitled section', items: (Array.isArray(s.items) ? s.items : []).filter(i => idOk(i.id)).slice(0, 200).map(i => ({ id: i.id, text: str(i.text, 300) })) }));
+  const sections = (Array.isArray(c.sections) ? c.sections : []).filter(s => idOk(s.id)).slice(0, 60)
+    .map(s => ({ id: s.id, title: str(s.title, 120) || 'Untitled section', items: (Array.isArray(s.items) ? s.items : []).filter(i => idOk(i.id)).slice(0, 200).map(i => { const o = { id: i.id, text: str(i.text, 300) }; const g = str(i.group, 80), c = str(i.category, 60), a = str(i.action, 300); if (g) o.group = g; if (c) o.category = c; if (a) o.action = a; return o; }) }));
   return { warehouses, managers, sections };
 }
 const getConfig = async () => Object.assign({}, EMPTY_CONFIG, await getSetting('config', EMPTY_CONFIG));

@@ -1,10 +1,16 @@
-# Render Blueprint: creates the web app and its Postgres database in one go.
+# Render Blueprint: creates the web app and its Postgres database, both on free plans.
 # Render dashboard > New > Blueprint > pick this repository.
+#
+# Free plan limits:
+#   - The free database is deleted 30 days after it's created. Upgrade it in Render, or move
+#     to another server, before then. Each Render workspace can have one free database.
+#   - The free web service sleeps after 15 minutes idle (first visit then takes about a minute).
+#   - Email must go through Resend (RESEND_API_KEY): free web services block SMTP.
 services:
   - type: web
     name: facility-check
     runtime: node
-    plan: free            # free works with Resend; switch to starter if you want SMTP (free blocks SMTP ports)
+    plan: free
     buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /healthz
@@ -21,5 +27,5 @@ services:
         sync: false       # Render asks you for this during setup
 databases:
   - name: facility-check-db
-    plan: basic-256mb     # paid (about $6/month). Render's free Postgres is deleted after 30 days.
+    plan: free
     databaseName: facility_check

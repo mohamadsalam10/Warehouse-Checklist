@@ -287,3 +287,19 @@ select{background:var(--surface);border:1px solid var(--line);border-radius:8px;
 .rcpt .x{color:var(--danger)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 @media (max-width:640px){.grid2{grid-template-columns:1fr}}
+
+/* Groups, corrective actions, checklist editor, import */
+.grp{padding:10px 20px 6px;background:var(--surface-2);border-bottom:1px solid var(--line);font-weight:700;font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.fix{margin:0;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--orange);font-size:.875rem;color:var(--body)}
+.fix-l{display:block;font-weight:700;font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--orange-press);margin-bottom:2px}
+.ed-grp{font-weight:700;font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:12px 0 6px}
+.ed-item input[type=text]{flex:1;min-width:0}
+.icon-btn.on{background:var(--fg);color:var(--surface);border-color:var(--fg)}
+.ed-more{display:grid;grid-template-columns:1fr 1fr 2fr;gap:6px;margin:0 0 10px}
+.ed-meta{font-size:.75rem;color:var(--muted);margin:-2px 0 8px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imp{border:1px solid var(--line);border-top:3px solid var(--orange);background:var(--surface);padding:16px;margin:0 0 16px}
+.imp-list{list-style:none;margin:8px 0 14px;padding:0;border-top:1px solid var(--line)}
+.imp-list li{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:.9375rem}
+label.btn{cursor:pointer}
+label.btn:focus-within{outline:2px solid var(--focus);outline-offset:2px}
+@media (max-width:640px){.ed-more{grid-template-columns:1fr}.ed-item{flex-wrap:wrap}.ed-item input[type=text]{flex-basis:100%}}
