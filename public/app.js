@@ -87,18 +87,19 @@ function saveDraft(d) {
 const scoreClass = s => s == null ? '' : s >= 90 ? 'good' : s >= 75 ? 'mid' : 'bad';
 const activeWh = () => (S.config.warehouses || []).filter(w => w.active !== false);
 const rowsForWeek = () => weekRows(S.config, Object.values(S.inspections));
+const supervisorsOf = whId => (S.users || []).filter(u => u.role === 'supervisor' && u.active && (u.warehouses || []).includes(whId));
 
 /* ---------- Tabs ---------- */
 function renderTabs() {
   const el = document.getElementById('tabs');
   if (!S.user) { el.innerHTML = ''; return; }
-  const tabs = [['inspect', 'Inspect'], ['reports', 'Reports']];
-  if (S.canEdit) tabs.push(['setup', 'Setup']);
-  tabs.push(['account', 'Account']);
-  el.innerHTML = tabs.map(([k, l]) => `<button class="tab" data-tab="${k}" ${S.tab === k ? 'aria-current="page"' : ''}>${l}</button>`).join('');
+  const tabs = S.canEdit ? [['inspect', 'Inspect'], ['reports', 'Reports'], ['setup', 'Setup'], ['account', 'Account']] : [['inspect', 'Inspect']];
+  el.innerHTML = tabs.map(([k, l]) => `<button class="tab" data-tab="${k}" ${S.tab === k ? 'aria-current="page"' : ''}>${l}</button>`).join('') +
+    (S.canEdit ? '' : `<button class="tab tab-sm" data-tab="account" ${S.tab === 'account' ? 'aria-current="page"' : ''}>${esc(S.user.name.split(' ')[0])} | Account</button>`);
 }
 document.getElementById('tabs').addEventListener('click', e => { const b = e.target.closest('[data-tab]'); if (b) goTab(b.dataset.tab); });
 function goTab(t) {
+  if (!S.canEdit && t !== 'inspect' && t !== 'account') t = 'inspect';
   if (S.draft) closeDraft();
   S.tab = t; S.armed = null; S.editWh = null;
   history.replaceState(null, '', t === 'inspect' ? location.pathname : `#${t}${t === 'reports' && S.week !== THIS_WEEK ? '/' + S.week : ''}`);
@@ -144,6 +145,7 @@ async function signedIn(user) {
   await loadConfig();
   renderTabs();
   await loadWeek();
+  if (S.canEdit) loadUsers();
   render();
 }
 async function signOut() {
@@ -172,7 +174,7 @@ async function loadWeek() {
   } catch (e) { S.weekLoaded = true; if (e.status !== 401) toast(e.message); }
 }
 async function loadUsers() {
-  try { const r = await api('GET', '/api/users'); S.users = r.users; if (S.tab === 'setup' && !S.draft && !setupFocused()) renderSetup(); } catch (e) {}
+  try { const r = await api('GET', '/api/users'); S.users = r.users; if (!S.draft && !setupFocused() && (S.tab === 'setup' || S.tab === 'inspect')) render(); } catch (e) {}
 }
 const setupFocused = () => main.contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
 
@@ -181,6 +183,7 @@ function render() {
   if (!S.user) return renderAuth();
   if (!S.config) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
   if (S.draft) return;
+  if (!S.canEdit && S.tab !== 'inspect' && S.tab !== 'account') S.tab = 'inspect';
   if (S.tab === 'setup' && S.canEdit) renderSetup();
   else if (S.tab === 'reports') renderReports();
   else if (S.tab === 'account') renderAccount();
@@ -204,15 +207,21 @@ function weekHeader(sub) {
 /* ---------- Inspect home ---------- */
 function renderInspectHome() {
   const whs = activeWh();
+  if (!whs.length && !S.canEdit) {
+    main.innerHTML = weekHeader() + `<div class="empty"><h2>No warehouses assigned to you</h2><p>An admin needs to assign your warehouses before you can start the weekly checks.</p></div>`;
+    return;
+  }
   if (!whs.length) {
     main.innerHTML = weekHeader() + `<div class="empty"><h2>No warehouses yet</h2><p>${S.canEdit ? 'Add your warehouses, managers and supervisors in Setup to start the weekly checks.' : 'An admin needs to add warehouses before inspections can start.'}</p>${S.canEdit ? '<button class="btn primary" data-go="setup">Open Setup</button>' : ''}</div>`;
     return;
   }
   const done = whs.filter(w => S.inspections[w.id] && S.inspections[w.id].status === 'submitted').length;
   let html = weekHeader();
-  html += S.weekLoaded ? `<p class="progress-line"><strong>${done} of ${whs.length}</strong> warehouses inspected this week</p>` : `<p class="progress-line">Loading this week’s inspections…</p>`;
+  html += S.weekLoaded ? `<p class="progress-line"><strong>${done} of ${whs.length}</strong> ${S.canEdit ? 'warehouses' : 'of your warehouses'} inspected this week</p>` : `<p class="progress-line">Loading this week’s inspections…</p>`;
   if (!(S.config.sections || []).length) html += `<div class="banner info"><div>The checklist is empty.${S.canEdit ? ' Add checklist points in Setup first.' : ' Ask an admin to set it up.'}</div>${S.canEdit ? '<button class="btn" data-go="setup">Open Setup</button>' : ''}</div>`;
-  if (S.weekLoaded && done === whs.length) {
+  if (S.weekLoaded && done === whs.length && !S.canEdit) {
+    html += `<div class="banner"><div><strong>All your warehouses are inspected for week ${weekNo(S.week)}.</strong> Thank you. The report goes to managers once every warehouse is done.</div></div>`;
+  } else if (S.weekLoaded && done === whs.length) {
     const r = S.report;
     const msg = r && (r.status === 'sent' || r.status === 'partial') ? `Report emailed to managers on ${fmtDateTime(r.sentAt)}.` : r && r.status === 'failed' ? 'The report email didn’t go out. Check Reports.' : 'The report is being emailed to managers.';
     html += `<div class="banner ${r && r.status === 'failed' ? 'info' : ''}"><div><strong>All warehouses are inspected for week ${weekNo(S.week)}.</strong> ${msg}</div><button class="btn primary" data-go="reports">View report</button></div>`;
@@ -223,7 +232,7 @@ function renderInspectHome() {
     if (!i) status = '<span class="pill">Not started</span>';
     else if (i.status === 'submitted') { cls = 'st-submitted'; status = `<span class="pill ok">Submitted</span><span class="score ${scoreClass(st.score)}">${st.score == null ? '–' : st.score + '%'}</span>`; }
     else { cls = 'st-draft'; status = `<span class="pill prog">In progress, ${st.answered} of ${st.total}</span>`; }
-    return `<li><button class="wh ${cls}" data-open="${esc(w.id)}"><span class="wh-name">${esc(w.name)}</span><span class="wh-meta">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}</span><span class="wh-status">${status}</span></button></li>`;
+    return `<li><button class="wh ${cls}" data-open="${esc(w.id)}"><span class="wh-name">${esc(w.name)}</span><span class="wh-meta">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${S.canEdit && S.users ? (() => { const sv = supervisorsOf(w.id); return sv.length ? ` | ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor assigned</span>'; })() : ''}</span><span class="wh-status">${status}</span></button></li>`;
   }).join('') + '</ul>';
   main.innerHTML = html;
 }
@@ -419,7 +428,7 @@ function renderReports() {
   const mgrs = S.config.managers || [];
   const r = S.report;
   html += `<section class="panel"><span class="eyebrow dash">Weekly report</span><h2>Email to managers</h2>
-    <p class="hint">When the last warehouse is submitted, each manager is emailed the results for their warehouses, with photos and the full report attached.</p>
+    <p class="hint">Sent automatically once, when the last warehouse of the week is submitted. Admins can also send it by hand at any time with Send now. Each manager gets the results for their warehouses, with photos and the full report attached.</p>
     ${emailStatusHTML(rows)}
     <div class="send-actions">
       ${submitted.length ? `<a class="btn" href="/api/reports/${S.week}/download">Download report</a>` : ''}
@@ -479,7 +488,7 @@ function renderSetup() {
   html += `<section class="panel"><span class="eyebrow dash">Warehouses</span><h2>Warehouse locations</h2><p class="hint">The supervisor inspects every active warehouse each week. The report emails once all active warehouses are submitted.</p>
     <div class="add-row"><input type="text" id="whName" placeholder="Warehouse name" aria-label="Warehouse name"><input type="text" id="whCode" placeholder="Code (optional)" aria-label="Code"><input type="text" id="whLoc" placeholder="Location (optional)" aria-label="Location"><button class="btn primary" data-addwh>Add warehouse</button></div>
     ${whs.length ? '<ul class="rows">' + whs.map(w => S.editWh === w.id ? `<li><div class="add-row" style="margin:0"><input type="text" data-ew="name" value="${esc(w.name)}" aria-label="Name"><input type="text" data-ew="code" value="${esc(w.code || '')}" placeholder="Code" aria-label="Code"><input type="text" data-ew="location" value="${esc(w.location || '')}" placeholder="Location" aria-label="Location"><button class="btn primary" data-savewh="${esc(w.id)}">Save</button></div></li>` :
-      `<li class="${w.active === false ? 'inactive' : ''}"><div class="row-main"><div class="grow"><div class="t">${esc(w.name)}</div><div class="m">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}</div></div>
+      `<li class="${w.active === false ? 'inactive' : ''}"><div class="row-main"><div class="grow"><div class="t">${esc(w.name)}</div><div class="m">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${S.users ? (() => { const sv = supervisorsOf(w.id); return sv.length ? ` | Supervisor: ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor assigned</span>'; })() : ''}</div></div>
       <label class="toggle"><input type="checkbox" data-activewh="${esc(w.id)}" ${w.active !== false ? 'checked' : ''}> Active</label>
       <button class="btn sm" data-editwh="${esc(w.id)}">Edit</button>
       <button class="btn sm danger ${S.armed === 'wh' + w.id ? 'armed' : ''}" data-delwh="${esc(w.id)}">${S.armed === 'wh' + w.id ? 'Confirm delete' : 'Delete'}</button></div></li>`).join('') + '</ul>' : '<p class="muted">No warehouses yet.</p>'}
@@ -508,7 +517,8 @@ function renderSetup() {
 
   const users = S.users;
   html += `<section class="panel"><span class="eyebrow dash">People</span><h2>Users</h2>
-    <p class="hint">Supervisors sign in to fill in checklists. Admins also manage this Setup page. Give each person a temporary password; they can change it under Account.</p>
+    <p class="hint">Supervisors only see the Inspect page and only the warehouses ticked under their name. Admins see everything, including Reports and Setup. Give each person a temporary password; they can change it under Account.</p>
+    ${(() => { const un = activeWh().filter(w => S.users && !supervisorsOf(w.id).length); return S.users && un.length && S.users.some(u => u.role === 'supervisor') ? `<div class="status-box wait"><strong>${un.length} warehouse${un.length === 1 ? ' has' : 's have'} no supervisor:</strong><p>${esc(un.map(w => w.name).join(', '))}. Only admins can inspect ${un.length === 1 ? 'it' : 'them'} until you tick ${un.length === 1 ? 'it' : 'them'} under a supervisor.</p></div>` : ''; })()}
     <div class="add-row" style="grid-template-columns:1.1fr 1.4fr .9fr 1.1fr auto"><input type="text" id="uName" placeholder="Name" aria-label="User name"><input type="email" id="uEmail" placeholder="Email" aria-label="User email">
       <select id="uRole" aria-label="Role"><option value="supervisor">Supervisor</option><option value="admin">Admin</option></select>
       <input type="text" id="uPw" placeholder="Temporary password" aria-label="Temporary password"><button class="btn primary" data-adduser>Add user</button></div>
@@ -518,6 +528,7 @@ function renderSetup() {
       ${u.id === S.user.id ? '' : `<label class="toggle"><input type="checkbox" data-uactive="${u.id}" ${u.active ? 'checked' : ''}> Active</label>
       <button class="btn sm" data-upw="${u.id}">Reset password</button>
       <button class="btn sm danger ${S.armed === 'u' + u.id ? 'armed' : ''}" data-udel="${u.id}">${S.armed === 'u' + u.id ? 'Confirm delete' : 'Delete'}</button>`}</div>
+      ${u.role === 'supervisor' ? `<div class="scope"><span class="muted" style="font-size:.8125rem">Warehouses:</span>${whs.length ? whs.map(w => `<label><input type="checkbox" data-uwh="${u.id}" value="${esc(w.id)}" ${(u.warehouses || []).includes(w.id) ? 'checked' : ''}> ${esc(w.name)}</label>`).join('') : '<span class="muted" style="font-size:.8125rem">Add warehouses first.</span>'}${whs.length && !(u.warehouses || []).length ? '<span class="warn-t" style="font-size:.8125rem">None assigned, so this supervisor sees nothing</span>' : ''}</div>` : ''}
       ${S.resetFor === u.id ? `<div class="grid2" style="margin-top:10px;max-width:560px"><input type="text" id="rPw" placeholder="New temporary password" aria-label="New password"><div><button class="btn primary" data-upwsave="${u.id}">Set password</button></div></div>` : ''}</li>`).join('') + '</ul>'}
   </section>`;
 
@@ -691,7 +702,7 @@ async function addUser() {
   const err = document.getElementById('uErr');
   try {
     await api('POST', '/api/users', { name: document.getElementById('uName').value, email: document.getElementById('uEmail').value, role: document.getElementById('uRole').value, password: document.getElementById('uPw').value });
-    toast('User added. Share their email and temporary password with them.');
+    toast(document.getElementById('uRole').value === 'supervisor' ? 'User added. Now tick their warehouses below, then share their email and temporary password.' : 'User added. Share their email and temporary password with them.');
     await loadUsers(); renderSetup();
   } catch (e) { err.hidden = false; err.textContent = e.message; }
 }
@@ -803,6 +814,10 @@ main.addEventListener('change', e => {
   if (ds.scopeall) { const m = S.config.managers.find(x => x.id === ds.scopeall); m.scope = t.checked ? 'all' : []; saveConfig(0); renderSetup(); return; }
   if (ds.scope) { const m = S.config.managers.find(x => x.id === ds.scope); const set = new Set(m.scope); t.checked ? set.add(t.value) : set.delete(t.value); m.scope = [...set]; saveConfig(0); return; }
   if (ds.urole) return updateUser(ds.urole, { role: t.value }, 'Role updated');
+  if (ds.uwh) {
+    const ids = [...main.querySelectorAll(`input[data-uwh="${ds.uwh}"]:checked`)].map(x => x.value);
+    return updateUser(ds.uwh, { warehouses: ids }, 'Warehouses updated');
+  }
   if (ds.uactive) return updateUser(ds.uactive, { active: t.checked }, t.checked ? 'User activated' : 'User deactivated and signed out');
 });
 main.addEventListener('keydown', e => {

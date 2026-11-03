@@ -303,3 +303,6 @@ select{background:var(--surface);border:1px solid var(--line);border-radius:8px;
 label.btn{cursor:pointer}
 label.btn:focus-within{outline:2px solid var(--focus);outline-offset:2px}
 @media (max-width:640px){.ed-more{grid-template-columns:1fr}.ed-item{flex-wrap:wrap}.ed-item input[type=text]{flex-basis:100%}}
+
+.tab-sm{font-size:.75rem;font-weight:500;margin-left:8px}
+.warn-t{color:var(--warning);font-weight:600}

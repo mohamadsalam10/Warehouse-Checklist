@@ -58,7 +58,10 @@ async function startSession(req, res, userId) {
   await q(`INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, now() + interval '${SESSION_DAYS} days')`, [sha(token), userId]);
   setSessionCookie(req, res, token, SESSION_DAYS * 86400);
 }
-const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active });
+const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, warehouses: Array.isArray(u.warehouses) ? u.warehouses : [] });
+// Supervisors only see and inspect the warehouses assigned to them; admins see all.
+const canInspect = (u, whId) => u.role === 'admin' || (Array.isArray(u.warehouses) && u.warehouses.includes(whId));
+const cleanWhList = v => Array.isArray(v) ? [...new Set(v.filter(x => typeof x === 'string' && /^[a-z0-9]{4,40}$/i.test(x)))].slice(0, 200) : [];
 
 /* ---------- Session + CSRF ---------- */
 app.use('/api', express.json({ limit: '4mb' }));
@@ -143,7 +146,7 @@ app.post('/api/users', admin, wrap(async (req, res) => {
   if (pw.length < 8) fail(400, 'Use a password of at least 8 characters.');
   const ex = await q('SELECT 1 FROM users WHERE email = $1', [email]);
   if (ex.rowCount) fail(409, 'A user with that email already exists.');
-  const r = await q('INSERT INTO users (email, name, role, password_hash) VALUES ($1, $2, $3, $4) RETURNING *', [email, name, role, hashPassword(pw)]);
+  const r = await q('INSERT INTO users (email, name, role, password_hash, warehouses) VALUES ($1, $2, $3, $4, $5) RETURNING *', [email, name, role, hashPassword(pw), JSON.stringify(cleanWhList(req.body.warehouses))]);
   res.json({ user: publicUser(r.rows[0]) });
 }));
 async function assertAdminRemains(exceptId) {
@@ -161,7 +164,8 @@ app.put('/api/users/:id', admin, wrap(async (req, res) => {
   if (u.role === 'admin' && u.active && (role !== 'admin' || !active)) await assertAdminRemains(id);
   let hash = u.password_hash;
   if (b.password) { if (String(b.password).length < 8) fail(400, 'Use a password of at least 8 characters.'); hash = hashPassword(String(b.password)); }
-  const out = await q('UPDATE users SET name = $1, role = $2, active = $3, password_hash = $4 WHERE id = $5 RETURNING *', [name, role, active, hash, id]);
+  const whs = b.warehouses !== undefined ? cleanWhList(b.warehouses) : (Array.isArray(u.warehouses) ? u.warehouses : []);
+  const out = await q('UPDATE users SET name = $1, role = $2, active = $3, password_hash = $4, warehouses = $5 WHERE id = $6 RETURNING *', [name, role, active, hash, JSON.stringify(whs), id]);
   if (!active || b.password) await q('DELETE FROM sessions WHERE user_id = $1', [id]);
   res.json({ user: publicUser(out.rows[0]) });
 }));
@@ -192,7 +196,8 @@ const getConfig = async () => Object.assign({}, EMPTY_CONFIG, await getSetting('
 const getSender = async () => Object.assign({ name: 'Facility Check', email: process.env.MAIL_FROM || '', replyTo: '' }, await getSetting('sender', {}));
 
 app.get('/api/config', auth, wrap(async (req, res) => {
-  const config = await getConfig();
+  let config = await getConfig();
+  if (req.user.role !== 'admin') config = { warehouses: config.warehouses.filter(w => canInspect(req.user, w.id)), sections: config.sections, managers: [] };
   const out = { config };
   if (req.user.role === 'admin') out.sender = await getSender(), out.mail = { provider: provider(), appUrl: APP_URL };
   res.json(out);
@@ -258,14 +263,17 @@ function checkWeek(week) { if (!FC.isWeekKey(week)) fail(400, 'That week isn’t
 
 app.get('/api/weeks/:week', auth, wrap(async (req, res) => {
   checkWeek(req.params.week);
-  const [inspections, rep] = await Promise.all([weekInspections(req.params.week), q('SELECT * FROM reports WHERE week = $1', [req.params.week])]);
-  res.json({ inspections, report: rowToReport(rep.rows[0]), mailConfigured: !!provider() });
+  const [all, rep] = await Promise.all([weekInspections(req.params.week), q('SELECT * FROM reports WHERE week = $1', [req.params.week])]);
+  const admin = req.user.role === 'admin';
+  const inspections = admin ? all : all.filter(i => canInspect(req.user, i.warehouseId));
+  res.json({ inspections, report: admin ? rowToReport(rep.rows[0]) : null, mailConfigured: !!provider() });
 }));
 
 async function upsertDraft(req) {
   const { week, wh } = req.params;
   checkWeek(week);
   if (week > FC.isoWeek(new Date())) fail(400, 'You can’t inspect a future week.');
+  if (!canInspect(req.user, wh)) fail(403, 'This warehouse isn’t assigned to you. Ask an admin.');
   const answers = cleanAnswers(req.body.answers);
   const ex = await q('SELECT * FROM inspections WHERE week = $1 AND warehouse_id = $2', [week, wh]);
   if (ex.rowCount) {
@@ -305,6 +313,7 @@ app.post('/api/inspections/:week/:wh/submit', auth, wrap(async (req, res) => {
 
 app.post('/api/inspections/:week/:wh/reopen', auth, wrap(async (req, res) => {
   checkWeek(req.params.week);
+  if (!canInspect(req.user, req.params.wh)) fail(403, 'This warehouse isn’t assigned to you. Ask an admin.');
   const r = await q(`UPDATE inspections SET status = 'draft', submitted_by = NULL, submitted_at = NULL, updated_at = now()
     WHERE week = $1 AND warehouse_id = $2 RETURNING *`, [req.params.week, req.params.wh]);
   if (!r.rowCount) fail(404, 'Inspection not found.');
@@ -408,7 +417,7 @@ app.post('/api/reports/:week/send', admin, wrap(async (req, res) => {
   res.json({ report: rowToReport(rep.rows[0]) });
 }));
 
-app.get('/api/reports/:week/download', auth, wrap(async (req, res) => {
+app.get('/api/reports/:week/download', admin, wrap(async (req, res) => {
   checkWeek(req.params.week);
   const week = req.params.week;
   const rows = FC.weekRows(await getConfig(), await weekInspections(week));

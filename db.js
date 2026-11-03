@@ -75,6 +75,7 @@ async function init() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS warehouses JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await q(`DELETE FROM sessions WHERE expires_at < now()`);
 }
 
