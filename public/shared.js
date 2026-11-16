@@ -71,6 +71,16 @@
       'No water leaks found']]
   ];
 
+
+  const STANDARD_CLEANING = [
+    ['Floors', ['Sweep all floors, including corners and side areas', 'Mop floors (dry mop in corridors; don’t over-wet)', 'Remove stains and sticky spots', 'Dry any standing water']],
+    ['Glass, doors and handles', ['Clean entrance door glass and panels, including edges and corners', 'Wipe door handles with disinfectant', 'Clean windows and office glass', 'Dust wooden unit doors (dry dusting only)']],
+    ['Bins and waste', ['Empty all bins and replace liners', 'Remove waste around bins and outside the entrance', 'Remove cardboard, wrap and items left in corridors']],
+    ['Client bathroom', ['Clean toilet bowl and outer surfaces with disinfectant', 'Clean sink and mirror', 'Mop floor with bathroom-grade detergent and dry it', 'Refill soap, paper towels and toilet paper']],
+    ['Waiting room and office', ['Wipe chairs, tables, desks and sofas', 'Keep exactly 3 full water bottles; remove empty ones', 'Wipe TV and screens with screen-safe cleaner', 'Arrange furniture and items in place']],
+    ['Finishing', ['Wipe switches and brand signage', 'Check for bad smells; refresh air freshener or diffuser', 'Return cleaning materials to storage', 'Close all unit doors']]
+  ];
+  const standardCleaning = () => STANDARD_CLEANING.map(([t, items]) => ({ id: uid(), title: t, items: items.map(x => ({ id: uid(), text: x })) }));
   const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
   const standardSections = () => STANDARD.map(([t, items]) => ({ id: uid(), title: t, items: items.map(x => ({ id: uid(), text: x })) }));
   const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
@@ -153,5 +163,5 @@
   }
   function managerRows(m, rows) { return m.scope === 'all' || !Array.isArray(m.scope) ? rows : rows.filter(r => m.scope.includes(r.w.id)); }
 
-  return { STANDARD, uid, standardSections, cap, esc, isoWeek, weekStart, shiftWeek, isWeekKey, weekNo, weekRangeText, fmtDate, fmtDateTime, stats, issuesOf, otherPhotos, weekRows, managerRows, TZ };
+  return { STANDARD, STANDARD_CLEANING, standardCleaning, uid, standardSections, cap, esc, isoWeek, weekStart, shiftWeek, isWeekKey, weekNo, weekRangeText, fmtDate, fmtDateTime, stats, issuesOf, otherPhotos, weekRows, managerRows, TZ };
 });

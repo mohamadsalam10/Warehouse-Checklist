@@ -58,9 +58,10 @@ async function startSession(req, res, userId) {
   await q(`INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, now() + interval '${SESSION_DAYS} days')`, [sha(token), userId]);
   setSessionCookie(req, res, token, SESSION_DAYS * 86400);
 }
-const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, warehouses: Array.isArray(u.warehouses) ? u.warehouses : [] });
+const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, warehouses: Array.isArray(u.warehouses) ? u.warehouses : [], schedule: Array.isArray(u.schedule) ? u.schedule : [] });
 // Supervisors only see and inspect the warehouses assigned to them; admins see all.
-const canInspect = (u, whId) => u.role === 'admin' || (Array.isArray(u.warehouses) && u.warehouses.includes(whId));
+const canInspect = (u, whId) => u.role === 'admin' || (u.role === 'supervisor' && Array.isArray(u.warehouses) && u.warehouses.includes(whId));
+const ROLES = ['admin', 'supervisor', 'cleaner'];
 const cleanWhList = v => Array.isArray(v) ? [...new Set(v.filter(x => typeof x === 'string' && /^[a-z0-9]{4,40}$/i.test(x)))].slice(0, 200) : [];
 
 /* ---------- Session + CSRF ---------- */
@@ -140,13 +141,14 @@ app.get('/api/users', admin, wrap(async (req, res) => {
 }));
 app.post('/api/users', admin, wrap(async (req, res) => {
   const name = str(req.body.name, 120), email = str(req.body.email, 200).toLowerCase(), pw = String(req.body.password || '');
-  const role = req.body.role === 'admin' ? 'admin' : 'supervisor';
+  const role = ROLES.includes(req.body.role) ? req.body.role : 'supervisor';
   if (!name) fail(400, 'Enter a name.');
   if (!isEmail(email)) fail(400, 'Enter a valid email address.');
   if (pw.length < 8) fail(400, 'Use a password of at least 8 characters.');
   const ex = await q('SELECT 1 FROM users WHERE email = $1', [email]);
   if (ex.rowCount) fail(409, 'A user with that email already exists.');
-  const r = await q('INSERT INTO users (email, name, role, password_hash, warehouses) VALUES ($1, $2, $3, $4, $5) RETURNING *', [email, name, role, hashPassword(pw), JSON.stringify(cleanWhList(req.body.warehouses))]);
+  const r = await q('INSERT INTO users (email, name, role, password_hash, warehouses, schedule) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', [email, name, role, hashPassword(pw), JSON.stringify(cleanWhList(req.body.warehouses)), JSON.stringify(cleanSchedule(req.body.schedule))]);
+  if (role === 'cleaner') await syncDay(localDate(), { prune: true });
   res.json({ user: publicUser(r.rows[0]) });
 }));
 async function assertAdminRemains(exceptId) {
@@ -159,13 +161,15 @@ app.put('/api/users/:id', admin, wrap(async (req, res) => {
   if (!r.rowCount) fail(404, 'User not found.');
   const u = r.rows[0], b = req.body;
   const name = b.name != null ? str(b.name, 120) || u.name : u.name;
-  const role = b.role === 'admin' || b.role === 'supervisor' ? b.role : u.role;
+  const role = ROLES.includes(b.role) ? b.role : u.role;
   const active = typeof b.active === 'boolean' ? b.active : u.active;
   if (u.role === 'admin' && u.active && (role !== 'admin' || !active)) await assertAdminRemains(id);
   let hash = u.password_hash;
   if (b.password) { if (String(b.password).length < 8) fail(400, 'Use a password of at least 8 characters.'); hash = hashPassword(String(b.password)); }
   const whs = b.warehouses !== undefined ? cleanWhList(b.warehouses) : (Array.isArray(u.warehouses) ? u.warehouses : []);
-  const out = await q('UPDATE users SET name = $1, role = $2, active = $3, password_hash = $4, warehouses = $5 WHERE id = $6 RETURNING *', [name, role, active, hash, JSON.stringify(whs), id]);
+  const sched = b.schedule !== undefined ? cleanSchedule(b.schedule) : (Array.isArray(u.schedule) ? u.schedule : []);
+  const out = await q('UPDATE users SET name = $1, role = $2, active = $3, password_hash = $4, warehouses = $5, schedule = $6 WHERE id = $7 RETURNING *', [name, role, active, hash, JSON.stringify(whs), JSON.stringify(sched), id]);
+  if (b.schedule !== undefined || b.role !== undefined || typeof b.active === 'boolean') await syncDay(localDate(), { prune: true });
   if (!active || b.password) await q('DELETE FROM sessions WHERE user_id = $1', [id]);
   res.json({ user: publicUser(out.rows[0]) });
 }));
@@ -180,7 +184,7 @@ app.delete('/api/users/:id', admin, wrap(async (req, res) => {
 }));
 
 /* ---------- Config: warehouses, managers, checklist ---------- */
-const EMPTY_CONFIG = { warehouses: [], managers: [], sections: [] };
+const EMPTY_CONFIG = { warehouses: [], managers: [], sections: [], cleaning: { sections: [] } };
 const idOk = v => typeof v === 'string' && /^[a-z0-9]{4,40}$/i.test(v);
 function cleanConfig(c) {
   const warehouses = (Array.isArray(c.warehouses) ? c.warehouses : []).filter(w => idOk(w.id) && str(w.name)).slice(0, 200)
@@ -190,14 +194,20 @@ function cleanConfig(c) {
     .map(m => ({ id: m.id, name: str(m.name, 120), email: str(m.email, 200), scope: Array.isArray(m.scope) ? m.scope.filter(x => whIds.has(x)) : 'all' }));
   const sections = (Array.isArray(c.sections) ? c.sections : []).filter(s => idOk(s.id)).slice(0, 60)
     .map(s => ({ id: s.id, title: str(s.title, 120) || 'Untitled section', items: (Array.isArray(s.items) ? s.items : []).filter(i => idOk(i.id)).slice(0, 200).map(i => { const o = { id: i.id, text: str(i.text, 300) }; const g = str(i.group, 80), c = str(i.category, 60), a = str(i.action, 300); if (g) o.group = g; if (c) o.category = c; if (a) o.action = a; return o; }) }));
-  return { warehouses, managers, sections };
+  const cleaning = { sections: cleanSections(c.cleaning && c.cleaning.sections, false) };
+  return { warehouses, managers, sections, cleaning };
+}
+function cleanSections(list, full) {
+  return (Array.isArray(list) ? list : []).filter(s => idOk(s.id)).slice(0, 60)
+    .map(s => ({ id: s.id, title: str(s.title, 120) || 'Untitled section', items: (Array.isArray(s.items) ? s.items : []).filter(i => idOk(i.id)).slice(0, 200).map(i => { const o = { id: i.id, text: str(i.text, 300) }; const g = str(i.group, 80); if (g) o.group = g; if (full) { const c = str(i.category, 60), a = str(i.action, 300); if (c) o.category = c; if (a) o.action = a; } return o; }) }));
 }
 const getConfig = async () => Object.assign({}, EMPTY_CONFIG, await getSetting('config', EMPTY_CONFIG));
 const getSender = async () => Object.assign({ name: 'Facility Check', email: process.env.MAIL_FROM || '', replyTo: '' }, await getSetting('sender', {}));
 
 app.get('/api/config', auth, wrap(async (req, res) => {
   let config = await getConfig();
-  if (req.user.role !== 'admin') config = { warehouses: config.warehouses.filter(w => canInspect(req.user, w.id)), sections: config.sections, managers: [] };
+  if (req.user.role === 'supervisor') config = { warehouses: config.warehouses.filter(w => canInspect(req.user, w.id)), sections: config.sections, managers: [], cleaning: { sections: [] } };
+  else if (req.user.role === 'cleaner') config = { warehouses: [], sections: [], managers: [], cleaning: { sections: [] } };
   const out = { config };
   if (req.user.role === 'admin') out.sender = await getSender(), out.mail = { provider: provider(), appUrl: APP_URL };
   res.json(out);
@@ -205,6 +215,7 @@ app.get('/api/config', auth, wrap(async (req, res) => {
 app.put('/api/config', admin, wrap(async (req, res) => {
   const config = cleanConfig(req.body || {});
   await setSetting('config', config);
+  await syncDay(localDate(), { prune: true });
   res.json({ config });
 }));
 
@@ -263,6 +274,7 @@ function checkWeek(week) { if (!FC.isWeekKey(week)) fail(400, 'That week isn’t
 
 app.get('/api/weeks/:week', auth, wrap(async (req, res) => {
   checkWeek(req.params.week);
+  if (req.user.role === 'cleaner') return res.json({ inspections: [], report: null, mailConfigured: true });
   const [all, rep] = await Promise.all([weekInspections(req.params.week), q('SELECT * FROM reports WHERE week = $1', [req.params.week])]);
   const admin = req.user.role === 'admin';
   const inspections = admin ? all : all.filter(i => canInspect(req.user, i.warehouseId));
@@ -424,6 +436,142 @@ app.get('/api/reports/:week/download', admin, wrap(async (req, res) => {
   const { map } = await photoDataFor(rows);
   res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Content-Disposition': `attachment; filename="Facility-inspection-${week}.html"` });
   res.send(buildReportFile({ week, rows, photoData: map }));
+}));
+
+
+/* ---------- Cleaning: schedules, daily work orders, records ---------- */
+const TZ = process.env.APP_TIMEZONE || 'Asia/Dubai';
+const localDate = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+const isDateKey = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(Date.parse(v + 'T00:00:00Z'));
+const weekdayOf = date => new Date(date + 'T00:00:00Z').getUTCDay() || 7; // 1 = Monday ... 7 = Sunday
+const addDays = (date, n) => { const d = new Date(date + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+function cleanSchedule(v) {
+  return (Array.isArray(v) ? v : []).slice(0, 50).map(r => ({
+    id: idOk(r && r.id) ? r.id : crypto.randomBytes(5).toString('hex'),
+    days: [...new Set((Array.isArray(r && r.days) ? r.days : []).map(Number).filter(d => d >= 1 && d <= 7))].sort(),
+    warehouses: cleanWhList(r && r.warehouses)
+  }));
+}
+const isCleaner = (req, res, next) => req.user && req.user.role === 'cleaner' ? next() : next(new HttpError(403, 'Only cleaners can do this.'));
+
+/* Creates the day's work orders from each cleaner's schedule. prune (today only) also removes
+   untouched orders that are no longer scheduled and refreshes their checklist. */
+async function syncDay(date, { prune }) {
+  const cfg = await getConfig();
+  const whMap = {}; cfg.warehouses.filter(w => w.active !== false).forEach(w => { whMap[w.id] = w; });
+  const sections = JSON.stringify((cfg.cleaning && cfg.cleaning.sections) || []);
+  const wd = weekdayOf(date);
+  const cleaners = (await q(`SELECT id, schedule FROM users WHERE role = 'cleaner' AND active`)).rows;
+  const keep = new Set();
+  for (const c of cleaners) {
+    const want = new Set();
+    (c.schedule || []).forEach(r => { if ((r.days || []).includes(wd)) (r.warehouses || []).forEach(id => { if (whMap[id]) want.add(id); }); });
+    for (const id of want) {
+      keep.add(c.id + ':' + id);
+      const w = whMap[id];
+      await q(`INSERT INTO cleaning_jobs (job_date, cleaner_id, warehouse_id, warehouse_name, warehouse_location, sections)
+               VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (job_date, cleaner_id, warehouse_id) DO NOTHING`,
+        [date, c.id, id, w.name, w.location || '', sections]);
+    }
+  }
+  if (!prune) return;
+  const untouched = `status = 'open' AND checks = '{}'::jsonb AND photos = '[]'::jsonb AND note = '' AND started_at IS NULL`;
+  const rows = (await q(`SELECT id, cleaner_id, warehouse_id FROM cleaning_jobs WHERE job_date = $1 AND ${untouched}`, [date])).rows;
+  const drop = rows.filter(r => !keep.has(r.cleaner_id + ':' + r.warehouse_id)).map(r => r.id);
+  if (drop.length) await q('DELETE FROM cleaning_jobs WHERE id = ANY($1)', [drop]);
+  await q(`UPDATE cleaning_jobs SET sections = $2 WHERE job_date = $1 AND ${untouched}`, [date, sections]);
+}
+let lastEnsure = 0, ensuring = null;
+/* Called whenever someone opens cleaning screens: fills in any days since the last run (max 14). */
+async function ensureCleaningJobs(force) {
+  if (!force && Date.now() - lastEnsure < 60000) return ensuring;
+  lastEnsure = Date.now();
+  ensuring = (async () => {
+    const today = localDate();
+    const through = await getSetting('cleaningThrough', null);
+    let d = through ? addDays(through, 1) : today;
+    if (d < addDays(today, -14)) d = addDays(today, -14);
+    for (; d < today; d = addDays(d, 1)) await syncDay(d, { prune: false });
+    await syncDay(today, { prune: true });
+    await setSetting('cleaningThrough', today);
+  })();
+  return ensuring;
+}
+const rowToJob = r => ({
+  id: r.id, date: r.job_date instanceof Date ? r.job_date.toISOString().slice(0, 10) : String(r.job_date).slice(0, 10),
+  cleanerId: r.cleaner_id, cleanerName: r.cleaner_name || '', warehouseId: r.warehouse_id, warehouseName: r.warehouse_name, location: r.warehouse_location,
+  sections: r.sections, checks: r.checks, photos: r.photos, note: r.note, status: r.status,
+  startedAt: r.started_at ? +r.started_at : null, completedAt: r.completed_at ? +r.completed_at : null, updatedAt: +r.updated_at
+});
+function cleanChecks(v, sections) {
+  const ids = new Set(); (sections || []).forEach(s => s.items.forEach(i => ids.add(i.id)));
+  const out = {}; if (v && typeof v === 'object') Object.keys(v).forEach(k => { if (ids.has(k) && v[k] === true) out[k] = true; });
+  return out;
+}
+const cleanPhotos = v => (Array.isArray(v) ? v : []).filter(p => /^[a-f0-9]{32}$/.test(p)).slice(0, 20);
+async function ownJob(req) {
+  const r = await q(`SELECT j.*, u.name AS cleaner_name FROM cleaning_jobs j JOIN users u ON u.id = j.cleaner_id WHERE j.id = $1`, [Number(req.params.id)]);
+  if (!r.rowCount) fail(404, 'Work order not found.');
+  const j = r.rows[0];
+  if (req.user.role !== 'admin' && j.cleaner_id !== req.user.id) fail(403, 'This work order isn’t yours.');
+  return j;
+}
+const jobDate = j => rowToJob(j).date;
+
+// Cleaner: today's work orders and the weekly schedule
+app.get('/api/cleaner/today', isCleaner, wrap(async (req, res) => {
+  await ensureCleaningJobs();
+  const today = localDate();
+  const jobs = (await q(`SELECT j.*, $3::text AS cleaner_name FROM cleaning_jobs j WHERE job_date = $1 AND cleaner_id = $2 ORDER BY warehouse_location, warehouse_name`, [today, req.user.id, req.user.name])).rows.map(rowToJob);
+  const cfg = await getConfig();
+  const whMap = {}; cfg.warehouses.forEach(w => { whMap[w.id] = w; });
+  const schedule = (req.user.schedule || []).map(r => ({ days: r.days, warehouses: (r.warehouses || []).filter(id => whMap[id] && whMap[id].active !== false).map(id => ({ id, name: whMap[id].name, location: whMap[id].location || '' })) }));
+  // Next 7 days from the schedule (today included), so cleaners can plan ahead
+  const upcoming = [];
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(today, i), wd = weekdayOf(d), seen = new Set(), list = [];
+    schedule.forEach(r => { if ((r.days || []).includes(wd)) r.warehouses.forEach(w => { if (!seen.has(w.id)) { seen.add(w.id); list.push(w); } }); });
+    list.sort((a, b) => (a.location || '').localeCompare(b.location || '') || a.name.localeCompare(b.name));
+    upcoming.push({ date: d, weekday: wd, warehouses: list });
+  }
+  res.json({ date: today, weekday: weekdayOf(today), jobs, schedule, upcoming, checklist: (cfg.cleaning && cfg.cleaning.sections) || [] });
+}));
+async function saveJob(req, complete) {
+  const j = await ownJob(req);
+  if (req.user.role === 'cleaner' && jobDate(j) !== localDate()) fail(400, 'You can only update today’s work orders.');
+  if (j.status === 'done') fail(409, 'This work order is already done. Reopen it to make changes.');
+  const checks = cleanChecks(req.body.checks, j.sections), photos = cleanPhotos(req.body.photos), note = str(req.body.note, 1000);
+  let status = 'open', completedAt = null;
+  if (complete) {
+    const total = (j.sections || []).reduce((n, s) => n + s.items.length, 0), left = total - Object.keys(checks).length;
+    if (left && !note) fail(400, `${left} point${left === 1 ? ' isn’t' : 's aren’t'} ticked. Tick ${left === 1 ? 'it' : 'them'}, or add a note explaining why.`);
+    status = 'done'; completedAt = new Date();
+  }
+  const r = await q(`UPDATE cleaning_jobs SET checks = $2, photos = $3, note = $4, status = $5, completed_at = $6,
+      started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 RETURNING *`,
+    [j.id, JSON.stringify(checks), JSON.stringify(photos), note, status, completedAt]);
+  return rowToJob(Object.assign(r.rows[0], { cleaner_name: j.cleaner_name }));
+}
+app.put('/api/cleaning/jobs/:id', auth, wrap(async (req, res) => res.json({ job: await saveJob(req, false) })));
+app.post('/api/cleaning/jobs/:id/complete', auth, wrap(async (req, res) => res.json({ job: await saveJob(req, true) })));
+app.post('/api/cleaning/jobs/:id/reopen', auth, wrap(async (req, res) => {
+  const j = await ownJob(req);
+  if (req.user.role === 'cleaner' && jobDate(j) !== localDate()) fail(400, 'You can only reopen today’s work orders.');
+  const r = await q(`UPDATE cleaning_jobs SET status = 'open', completed_at = NULL, updated_at = now() WHERE id = $1 RETURNING *`, [j.id]);
+  res.json({ job: rowToJob(Object.assign(r.rows[0], { cleaner_name: j.cleaner_name })) });
+}));
+
+// Admin: cleaning records for review
+app.get('/api/cleaning/records', admin, wrap(async (req, res) => {
+  await ensureCleaningJobs();
+  const today = localDate();
+  const to = isDateKey(req.query.to) ? req.query.to : today;
+  let from = isDateKey(req.query.from) ? req.query.from : to;
+  if (from > to) from = to;
+  if (from < addDays(to, -92)) from = addDays(to, -92);
+  const r = await q(`SELECT j.*, u.name AS cleaner_name FROM cleaning_jobs j JOIN users u ON u.id = j.cleaner_id
+                     WHERE job_date BETWEEN $1 AND $2 ORDER BY job_date DESC, u.name, warehouse_location, warehouse_name`, [from, to]);
+  res.json({ today, from, to, jobs: r.rows.map(rowToJob) });
 }));
 
 /* ---------- Static app ---------- */

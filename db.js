@@ -76,6 +76,30 @@ async function init() {
     );
   `);
   await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS warehouses JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  // Cleaners: new role, weekly schedule, and daily cleaning work orders
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS schedule JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await q(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+  await q(`ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('admin','supervisor','cleaner'))`);
+  await q(`
+    CREATE TABLE IF NOT EXISTS cleaning_jobs (
+      id SERIAL PRIMARY KEY,
+      job_date DATE NOT NULL,
+      cleaner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      warehouse_id TEXT NOT NULL,
+      warehouse_name TEXT NOT NULL,
+      warehouse_location TEXT NOT NULL DEFAULT '',
+      sections JSONB NOT NULL DEFAULT '[]'::jsonb,
+      checks JSONB NOT NULL DEFAULT '{}'::jsonb,
+      photos JSONB NOT NULL DEFAULT '[]'::jsonb,
+      note TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done')),
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (job_date, cleaner_id, warehouse_id)
+    );
+    CREATE INDEX IF NOT EXISTS cleaning_jobs_date ON cleaning_jobs (job_date);
+  `);
   await q(`DELETE FROM sessions WHERE expires_at < now()`);
 }
 

@@ -12,7 +12,7 @@ const S = {
   config: null, sender: null, mail: null, users: null,
   week: THIS_WEEK, inspections: {}, weekLoaded: false, report: null, mailConfigured: true,
   tab: 'inspect', draft: null, itemMap: {}, collapsed: {}, expanded: {}, uploading: {},
-  editWh: null, armed: null, edOpen: {}, importPreview: null, readOnly: false, stale: false, sending: false
+  editWh: null, armed: null, edOpen: {}, importPreview: null, setupTab: 'warehouses', cl: null, job: null, rec: null, readOnly: false, stale: false, sending: false
 };
 
 /* ---------- API ---------- */
@@ -90,21 +90,32 @@ const rowsForWeek = () => weekRows(S.config, Object.values(S.inspections));
 const supervisorsOf = whId => (S.users || []).filter(u => u.role === 'supervisor' && u.active && (u.warehouses || []).includes(whId));
 
 /* ---------- Tabs ---------- */
+const isCleanerUser = () => S.user && S.user.role === 'cleaner';
+function roleTabs() {
+  if (S.canEdit) return [['inspect', 'Inspect'], ['reports', 'Reports'], ['cleaning', 'Cleaning'], ['setup', 'Setup'], ['account', 'Account']];
+  if (isCleanerUser()) return [['today', 'Today'], ['schedule', 'My schedule']];
+  return [['inspect', 'Inspect']];
+}
+const homeTab = () => isCleanerUser() ? 'today' : 'inspect';
+function allowedTab(t) { return t === 'account' || roleTabs().some(x => x[0] === t); }
 function renderTabs() {
   const el = document.getElementById('tabs');
   if (!S.user) { el.innerHTML = ''; return; }
-  const tabs = S.canEdit ? [['inspect', 'Inspect'], ['reports', 'Reports'], ['setup', 'Setup'], ['account', 'Account']] : [['inspect', 'Inspect']];
+  const tabs = roleTabs();
   el.innerHTML = tabs.map(([k, l]) => `<button class="tab" data-tab="${k}" ${S.tab === k ? 'aria-current="page"' : ''}>${l}</button>`).join('') +
     (S.canEdit ? '' : `<button class="tab tab-sm" data-tab="account" ${S.tab === 'account' ? 'aria-current="page"' : ''}>${esc(S.user.name.split(' ')[0])} | Account</button>`);
 }
 document.getElementById('tabs').addEventListener('click', e => { const b = e.target.closest('[data-tab]'); if (b) goTab(b.dataset.tab); });
 function goTab(t) {
-  if (!S.canEdit && t !== 'inspect' && t !== 'account') t = 'inspect';
+  if (!allowedTab(t)) t = homeTab();
   if (S.draft) closeDraft();
+  if (S.job) closeJob();
   S.tab = t; S.armed = null; S.editWh = null;
-  history.replaceState(null, '', t === 'inspect' ? location.pathname : `#${t}${t === 'reports' && S.week !== THIS_WEEK ? '/' + S.week : ''}`);
+  history.replaceState(null, '', t === homeTab() ? location.pathname : `#${t}${t === 'reports' && S.week !== THIS_WEEK ? '/' + S.week : ''}`);
   renderTabs(); render(); window.scrollTo(0, 0);
   if (t === 'setup' && S.canEdit) loadUsers();
+  if (t === 'cleaning' && S.canEdit) loadRecords().then(() => { if (S.tab === 'cleaning') renderCleaning(); });
+  if ((t === 'today' || t === 'schedule') && isCleanerUser()) loadCleaner().then(() => { if (S.tab === t && !S.job) render(); });
 }
 
 /* ---------- Auth screens ---------- */
@@ -142,16 +153,19 @@ async function doSetup() {
 async function signedIn(user) {
   S.user = user; S.canEdit = user.role === 'admin';
   main.innerHTML = '<div class="loading">Loading…</div>';
+  if (!allowedTab(S.tab)) S.tab = homeTab();
+  if (user.role === 'cleaner') { renderTabs(); await loadCleaner(); render(); return; }
   await loadConfig();
   renderTabs();
   await loadWeek();
+  if (S.tab === 'cleaning') await loadRecords();
   if (S.canEdit) loadUsers();
   render();
 }
 async function signOut() {
   await flushAll();
   try { await api('POST', '/api/auth/logout'); } catch (e) {}
-  S.user = null; S.draft = null; S.config = null; S.tab = 'inspect';
+  S.user = null; S.draft = null; S.job = null; S.cl = null; S.rec = null; S.config = null; S.tab = 'inspect';
   history.replaceState(null, '', location.pathname);
   renderAuth();
 }
@@ -181,9 +195,13 @@ const setupFocused = () => main.contains(document.activeElement) && /INPUT|TEXTA
 /* ---------- Main render ---------- */
 function render() {
   if (!S.user) return renderAuth();
+  if (S.draft || S.job) return;
+  if (!allowedTab(S.tab)) S.tab = homeTab();
+  if (S.tab === 'today') return renderToday();
+  if (S.tab === 'schedule') return renderSchedule();
+  if (S.tab === 'account') return renderAccount();
   if (!S.config) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
-  if (S.draft) return;
-  if (!S.canEdit && S.tab !== 'inspect' && S.tab !== 'account') S.tab = 'inspect';
+  if (S.tab === 'cleaning') return renderCleaning();
   if (S.tab === 'setup' && S.canEdit) renderSetup();
   else if (S.tab === 'reports') renderReports();
   else if (S.tab === 'account') renderAccount();
@@ -397,6 +415,193 @@ async function reopenDraft() {
   } catch (e) { toast(e.message); }
 }
 
+/* ---------- Cleaner app: today's work orders and schedule ---------- */
+const prettyDate = d => new Date(d + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+const jobTotal = j => (j.sections || []).reduce((n, s) => n + s.items.length, 0);
+const jobDone = j => Object.keys(j.checks || {}).length;
+function jobState(j, today) {
+  if (j.status === 'done') return ['done', 'Done'];
+  if (j.startedAt || jobDone(j) || (j.photos || []).length) return j.date < today ? ['late', 'Not finished'] : ['prog', 'In progress'];
+  return j.date < today ? ['missed', 'Missed'] : ['todo', 'Not started'];
+}
+const statePill = ([k, l]) => `<span class="pill ${k === 'done' ? 'ok' : k === 'prog' ? 'prog' : k === 'missed' || k === 'late' ? 'bad' : ''}">${l}</span>`;
+async function loadCleaner() {
+  try { S.cl = await api('GET', '/api/cleaner/today'); } catch (e) { if (e.status !== 401) toast(e.message); }
+}
+function dayHeader(date, sub) {
+  const d = new Date(date + 'T00:00:00Z');
+  return `<section class="week" aria-label="Today"><div class="week-num"><span class="wk">${d.toLocaleDateString('en-GB', { weekday: 'long', timeZone: 'UTC' })}</span><span class="big">${d.getUTCDate()}</span></div>
+    <div class="week-info"><div class="range">${d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' })}</div>${sub ? `<div class="week-sub">${sub}</div>` : ''}</div></section>`;
+}
+function renderToday() {
+  if (!S.cl) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
+  const jobs = S.cl.jobs, done = jobs.filter(j => j.status === 'done').length;
+  let html = dayHeader(S.cl.date, jobs.length ? `${done} of ${jobs.length} work order${jobs.length === 1 ? '' : 's'} done today` : '');
+  if (!jobs.length) { main.innerHTML = html + `<div class="empty"><h2>Nothing scheduled today</h2><p>You have no warehouses to clean today.</p></div>` + tomorrowHTML(); return; }
+  if (done === jobs.length) html += `<div class="banner"><div><strong>All done for today.</strong> Thank you.</div></div>`;
+  html += '<ul class="wh-list">' + jobs.map(j => {
+    const st = jobState(j, S.cl.date), tot = jobTotal(j);
+    return `<li><button class="wh ${st[0] === 'done' ? 'st-submitted' : st[0] === 'prog' ? 'st-draft' : ''}" data-openjob="${j.id}"><span class="wh-name">${esc(j.warehouseName)}</span><span class="wh-meta">${esc(j.location || '') || '&nbsp;'}</span>
+      <span class="wh-status">${statePill(st)}${tot ? `<span class="muted" style="font-size:.875rem">${jobDone(j)}/${tot}</span>` : ''}</span></button></li>`;
+  }).join('') + '</ul>';
+  main.innerHTML = html + tomorrowHTML();
+}
+function whByLocation(list) {
+  const by = {};
+  list.forEach(w => { const l = w.location || ''; (by[l] = by[l] || []).push(w); });
+  return Object.keys(by).sort().map(l => `<div class="up-loc">${l ? `<span class="loc-t">${esc(l)}</span>` : ''}<span>${by[l].map(w => esc(w.name)).join(', ')}</span></div>`).join('');
+}
+function tomorrowHTML() {
+  const t = (S.cl.upcoming || [])[1]; if (!t) return '';
+  return `<section class="panel tomorrow"><span class="eyebrow dash">Tomorrow</span><h2>${prettyDate(t.date).replace(/ \d{4}$/, '')}</h2>
+    ${t.warehouses.length ? `<p class="hint" style="margin-bottom:10px">${t.warehouses.length} warehouse${t.warehouses.length === 1 ? '' : 's'} to clean:</p>${whByLocation(t.warehouses)}` : '<p class="hint" style="margin:0">Nothing scheduled. Day off.</p>'}
+    <button class="link-btn" data-tab-go="schedule" style="margin-top:8px">See the next 7 days</button></section>`;
+}
+function openJob(id) {
+  const j = S.cl.jobs.find(x => x.id === +id); if (!j) return;
+  S.job = clone(j); renderJob(); window.scrollTo(0, 0);
+}
+function closeJob() {
+  if (S.job) { const i = S.cl.jobs.findIndex(x => x.id === S.job.id); if (i >= 0) S.cl.jobs[i] = clone(S.job); }
+  S.job = null; const bar = document.querySelector('.cl-bar'); bar && bar.remove();
+}
+function renderJob() {
+  const j = S.job, ro = j.status === 'done', tot = jobTotal(j);
+  let html = `<div class="cl-head"><button class="btn ghost sm" data-backjob>‹ Today’s work orders</button>
+    <div style="margin-top:20px"><span class="eyebrow">Cleaning work order</span></div><h1>${esc(j.warehouseName)}</h1>
+    <div class="cl-sub">${prettyDate(j.date)}${j.location ? ' | ' + esc(j.location) : ''}</div></div>`;
+  if (ro) html += `<div class="banner"><div>Marked done at ${new Date(j.completedAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}.</div><button class="btn" data-reopenjob>Reopen</button></div>`;
+  else html += `<p class="hint">Tick each point as you finish it. When you’re done, add photos of the cleaned warehouse if you can, then tap Mark as done.</p>`;
+  if (!tot) html += `<div class="status-box wait"><strong>No cleaning points are set up yet.</strong><p>You can still add photos and mark this work order as done.</p></div>`;
+  html += (j.sections || []).map((sec, si) => {
+    const n = sec.items.filter(i => j.checks[i.id]).length;
+    let last = null;
+    return `<section class="sec"><div class="sec-head" style="cursor:default"><span class="sec-title"><span class="eyebrow dash">Section ${String(si + 1).padStart(2, '0')}</span><h2>${esc(sec.title)}</h2></span><span class="sec-right"><span data-jcount="${esc(sec.id)}">${n}/${sec.items.length}</span></span></div>
+      <div class="sec-body">${sec.items.map(it => { const g = it.group || ''; const h = g && g !== last ? `<div class="grp">${esc(g)}</div>` : ''; last = g;
+        return h + `<label class="tick ${j.checks[it.id] ? 'on' : ''}"><input type="checkbox" data-tick="${esc(it.id)}" ${j.checks[it.id] ? 'checked' : ''} ${ro ? 'disabled' : ''}><span class="box" aria-hidden="true"></span><span>${esc(it.text)}</span></label>`; }).join('')}</div></section>`;
+  }).join('');
+  html += `<section class="panel"><span class="eyebrow dash">After cleaning</span><h2>Photos and note</h2>
+    <p class="hint">Optional. Photos of the cleaned warehouse help managers review the work.</p>
+    <div class="photos">${(j.photos || []).map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="Photo of ${esc(j.warehouseName)} after cleaning" loading="lazy" data-view="${esc(p)}">${ro ? '' : `<button class="ph-x" data-rmjobphoto="${esc(p)}" aria-label="Remove photo">×</button>`}</div>`).join('')}
+      ${S.uploading.job ? '<div class="ph up">Uploading…</div>' : ''}${ro ? '' : `<label class="ph add"><input class="vh" type="file" accept="image/*" multiple data-jobphoto aria-label="Add photos"><span>+ Photo</span></label>`}</div>
+    ${ro && !j.note ? '' : `<textarea data-jobnote rows="2" style="margin-top:12px" placeholder="Note (optional). If a point couldn’t be done, explain why here." aria-label="Note" ${ro ? 'readonly' : ''}>${esc(j.note || '')}</textarea>`}
+  </section>`;
+  main.innerHTML = html;
+  let bar = document.querySelector('.cl-bar');
+  if (!bar) { bar = document.createElement('div'); bar.className = 'cl-bar'; document.body.appendChild(bar); }
+  bar.innerHTML = `<div class="cl-bar-in"><div class="bar-progress"><div class="meter"><span id="meter"></span></div><div class="bar-text" id="barText"></div></div>${ro ? '<button class="btn primary" data-backjob>Done</button>' : '<button class="btn primary" data-completejob>Mark as done</button>'}</div>`;
+  updateJobProgress();
+}
+function updateJobProgress() {
+  const j = S.job; if (!j) return;
+  const tot = jobTotal(j), n = jobDone(j);
+  const m = document.getElementById('meter'); if (m) m.style.width = (tot ? n / tot * 100 : 100) + '%';
+  const t = document.getElementById('barText'); if (t) t.textContent = tot ? `${n} of ${tot} points done` : 'No points to tick';
+  (j.sections || []).forEach(sec => { const el = main.querySelector(`[data-jcount="${CSS.escape(sec.id)}"]`); if (el) el.textContent = `${sec.items.filter(i => j.checks[i.id]).length}/${sec.items.length}`; });
+}
+function saveJob(d) {
+  const j = S.job;
+  const i = S.cl.jobs.findIndex(x => x.id === j.id); if (i >= 0) S.cl.jobs[i] = clone(j);
+  return queueSave('job:' + j.id, async () => { const r = await api('PUT', '/api/cleaning/jobs/' + j.id, { checks: j.checks, photos: j.photos, note: j.note }); if (S.job && S.job.id === j.id) S.job.startedAt = r.job.startedAt; }, d);
+}
+async function addJobPhotos(files) {
+  const j = S.job; if (!files.length) return;
+  S.uploading.job = (S.uploading.job || 0) + files.length; renderJob();
+  for (const f of files) {
+    try {
+      const blob = await compress(f);
+      if (!/^image\/(jpeg|png|webp)$/.test(blob.type)) throw new Error('Use a JPG, PNG or WebP photo.');
+      const r = await api('POST', '/api/photos', blob);
+      j.photos = (j.photos || []).concat(r.id);
+      if (S.job === j) saveJob(400);
+    } catch (e) { toast('Photo didn’t upload. ' + e.message); }
+    S.uploading.job--;
+  }
+  delete S.uploading.job;
+  if (S.job === j) renderJob();
+}
+async function completeJob(btn) {
+  const j = S.job, left = jobTotal(j) - jobDone(j);
+  if (left && !String(j.note || '').trim()) {
+    toast(`${left} point${left === 1 ? ' isn’t' : 's aren’t'} ticked. Tick ${left === 1 ? 'it' : 'them'}, or add a note explaining why.`);
+    const n = main.querySelector('[data-jobnote]'); n && (n.scrollIntoView({ block: 'center', behavior: 'smooth' }), n.focus());
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Saving…';
+  await flushAll();
+  try {
+    const r = await api('POST', `/api/cleaning/jobs/${j.id}/complete`, { checks: j.checks, photos: j.photos, note: j.note });
+    S.job = r.job; closeJob(); toast(`${r.job.warehouseName} done`); render(); window.scrollTo(0, 0);
+  } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = 'Mark as done'; }
+}
+async function reopenJob() {
+  try { const r = await api('POST', `/api/cleaning/jobs/${S.job.id}/reopen`); S.job = r.job; renderJob(); } catch (e) { toast(e.message); }
+}
+function renderSchedule() {
+  if (!S.cl) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
+  const up = S.cl.upcoming || [];
+  let html = `<span class="eyebrow dash">My schedule</span><h1 class="page-title" style="margin-bottom:8px">Next 7 days</h1>
+    <p class="hint">Where you’re cleaning, so you can prepare. Work orders open on the day itself.</p>
+    <ul class="up-list">` + up.map((d, i) => `<li class="${i === 0 ? 'is-today' : i === 1 ? 'is-tomorrow' : ''}">
+      <div class="up-day"><strong>${new Date(d.date + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', timeZone: 'UTC' })}</strong>
+        <span class="muted">${new Date(d.date + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'long', timeZone: 'UTC' })}</span>
+        ${i === 0 ? '<span class="pill prog">Today</span>' : i === 1 ? '<span class="pill">Tomorrow</span>' : ''}</div>
+      <div class="up-wh">${d.warehouses.length ? whByLocation(d.warehouses) : '<span class="muted">Day off</span>'}</div></li>`).join('') + '</ul>';
+  const cl = S.cl.checklist || [];
+  html += `<section class="panel"><span class="eyebrow dash">Cleaning points</span><h2>What to do at each warehouse</h2>
+    ${cl.length ? cl.map(sec => `<h4 style="margin:16px 0 6px">${esc(sec.title)}</h4><ul class="plain">${sec.items.map(i => `<li>${esc(i.text)}</li>`).join('')}</ul>`).join('') : '<p class="muted">No cleaning points are set up yet.</p>'}</section>`;
+  main.innerHTML = html;
+}
+
+/* ---------- Admin: cleaning records ---------- */
+const addDaysKey = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+async function loadRecords() {
+  const f = S.recF || (S.recF = {});
+  try {
+    const r = await api('GET', `/api/cleaning/records?${f.from ? 'from=' + f.from + '&' : ''}${f.to ? 'to=' + f.to : ''}`);
+    S.rec = r; if (!f.from) f.from = r.from; if (!f.to) f.to = r.to;
+  } catch (e) { if (e.status !== 401) toast(e.message); }
+}
+function renderCleaning() {
+  const f = S.recF || (S.recF = {}), R = S.rec;
+  let html = `<span class="eyebrow dash">Cleaning</span><h1 class="page-title" style="margin-bottom:16px">Cleaning records</h1>`;
+  if (!R) { main.innerHTML = html + '<div class="loading">Loading…</div>'; return; }
+  const today = R.today;
+  const cleaners = [...new Map(R.jobs.map(j => [j.cleanerId, j.cleanerName])).entries()];
+  const whs = [...new Map(R.jobs.map(j => [j.warehouseId, j.warehouseName])).entries()];
+  const jobs = R.jobs.filter(j => (!f.cleaner || j.cleanerId === +f.cleaner) && (!f.wh || j.warehouseId === f.wh) && (!f.st || jobState(j, today)[0] === f.st));
+  const count = k => jobs.filter(j => jobState(j, today)[0] === k).length;
+  const quick = [['Today', today, today], ['Yesterday', addDaysKey(today, -1), addDaysKey(today, -1)], ['Last 7 days', addDaysKey(today, -6), today], ['Last 30 days', addDaysKey(today, -29), today]];
+  html += `<div class="filters">
+    <div class="send-actions" style="margin:0">${quick.map(([l, a, b]) => `<button class="btn sm ${f.from === a && f.to === b ? 'primary' : ''}" data-recq="${a}|${b}">${l}</button>`).join('')}</div>
+    <div class="filter-row">
+      <label>From <input type="date" data-recf="from" value="${f.from || ''}" max="${today}"></label>
+      <label>To <input type="date" data-recf="to" value="${f.to || ''}" max="${today}"></label>
+      <select data-recf="cleaner" aria-label="Cleaner"><option value="">All cleaners</option>${cleaners.map(([id, n]) => `<option value="${id}" ${+f.cleaner === id ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+      <select data-recf="wh" aria-label="Warehouse"><option value="">All warehouses</option>${whs.map(([id, n]) => `<option value="${esc(id)}" ${f.wh === id ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+      <select data-recf="st" aria-label="Status"><option value="">Any status</option>${[['done', 'Done'], ['prog', 'In progress'], ['todo', 'Not started'], ['late', 'Not finished'], ['missed', 'Missed']].map(([k, l]) => `<option value="${k}" ${f.st === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    </div></div>`;
+  html += `<div class="rec-stats">${[['Done', count('done')], ['In progress', count('prog')], ['Not started', count('todo')], ['Not finished', count('late')], ['Missed', count('missed')]].map(([l, n]) => `<div><span class="lab">${l}</span><b>${n}</b></div>`).join('')}</div>`;
+  if (!jobs.length) html += `<div class="empty"><h2>No work orders</h2><p>No cleaning was scheduled for these dates and filters. Work orders come from cleaner schedules in Setup > Cleaning.</p></div>`;
+  const byDate = {};
+  jobs.forEach(j => (byDate[j.date] = byDate[j.date] || []).push(j));
+  Object.keys(byDate).sort().reverse().forEach(d => {
+    html += `<h3 class="rec-date">${prettyDate(d)}</h3><ul class="rec-list">` + byDate[d].map(j => {
+      const st = jobState(j, today), tot = jobTotal(j), open = S.recOpen === j.id;
+      return `<li class="${open ? 'open' : ''}"><button class="rec-row" data-recopen="${j.id}" aria-expanded="${open}">
+          <span class="rec-main"><strong>${esc(j.warehouseName)}</strong><span class="muted">${esc([j.location, j.cleanerName].filter(Boolean).join(' | '))}</span></span>
+          <span class="rec-side">${statePill(st)}<span class="muted">${tot ? jobDone(j) + '/' + tot : ''}${(j.photos || []).length ? ` | ${j.photos.length} photo${j.photos.length === 1 ? '' : 's'}` : ''}${j.completedAt ? ' | ' + new Date(j.completedAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : ''}</span></span></button>
+        ${open ? `<div class="rec-detail">
+          ${(j.sections || []).map(sec => `<h4>${esc(sec.title)}</h4><ul class="plain ticks">${sec.items.map(i => `<li class="${j.checks[i.id] ? 'y' : 'n'}">${j.checks[i.id] ? '✓' : '✗'} ${esc(i.text)}</li>`).join('')}</ul>`).join('')}
+          ${j.note ? `<p class="issue-note"><strong>Note:</strong> ${esc(j.note)}</p>` : ''}
+          ${(j.photos || []).length ? `<div class="gallery" style="margin-top:12px">${j.photos.map(p => `<figure><img src="/api/photos/${esc(p)}" alt="Photo of ${esc(j.warehouseName)} after cleaning" loading="lazy" data-view="${esc(p)}"></figure>`).join('')}</div>` : '<p class="muted" style="font-size:.875rem">No photos.</p>'}
+          ${j.status === 'done' ? `<button class="btn sm" style="margin-top:12px" data-recreopen="${j.id}">Reopen work order</button>` : ''}
+        </div>` : ''}</li>`;
+    }).join('') + '</ul>';
+  });
+  main.innerHTML = html;
+}
+
 /* ---------- Reports ---------- */
 function emailStatusHTML(rows) {
   const r = S.report;
@@ -466,7 +671,7 @@ async function sendNow() {
 /* ---------- Account ---------- */
 function renderAccount() {
   main.innerHTML = `<span class="eyebrow dash">Account</span><h1 class="page-title">${esc(S.user.name)}</h1>
-  <section class="panel"><h2>Your details</h2><p class="hint" style="margin-bottom:0">${esc(S.user.email)}<br>Role: ${S.user.role === 'admin' ? 'Admin' : 'Supervisor'}</p></section>
+  <section class="panel"><h2>Your details</h2><p class="hint" style="margin-bottom:0">${esc(S.user.email)}<br>Role: ${ROLE_LABEL[S.user.role] || S.user.role}</p></section>
   <section class="panel"><h2>Change password</h2><p class="hint">You’ll stay signed in on this device. Other devices are signed out.</p>
     <div class="grid2" style="max-width:560px"><input type="password" id="pwCur" placeholder="Current password" aria-label="Current password" autocomplete="current-password" style="min-height:40px;border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--surface)">
     <input type="password" id="pwNew" placeholder="New password (8+ characters)" aria-label="New password" autocomplete="new-password" style="min-height:40px;border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--surface)"></div>
@@ -479,22 +684,36 @@ async function changePassword() {
   catch (e) { err.hidden = false; err.textContent = e.message; }
 }
 
-/* ---------- Setup ---------- */
-function renderSetup() {
-  const c = S.config, whs = c.warehouses || [], mgrs = c.managers || [], secs = c.sections || [];
-  const snd = S.sender || {}, mail = S.mail || {};
-  let html = `<span class="eyebrow dash">Admin</span><h1 class="page-title">Setup</h1>`;
+/* ---------- Setup (split into tabs) ---------- */
+const SETUP_TABS = [['warehouses', 'Warehouses'], ['users', 'Users'], ['managers', 'Managers'], ['email', 'Email'], ['inspection', 'Inspection checklist'], ['cleaning', 'Cleaning']];
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const DAYS_LONG = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const ROLE_LABEL = { admin: 'Admin', supervisor: 'Supervisor', cleaner: 'Cleaner' };
+const secsOf = k => k === 'clean' ? ((S.config.cleaning || (S.config.cleaning = { sections: [] })).sections) : (S.config.sections || (S.config.sections = []));
+function setSecs(k, arr) { if (k === 'clean') { S.config.cleaning = S.config.cleaning || {}; S.config.cleaning.sections = arr; } else S.config.sections = arr; }
 
-  html += `<section class="panel"><span class="eyebrow dash">Warehouses</span><h2>Warehouse locations</h2><p class="hint">The supervisor inspects every active warehouse each week. The report emails once all active warehouses are submitted.</p>
-    <div class="add-row"><input type="text" id="whName" placeholder="Warehouse name" aria-label="Warehouse name"><input type="text" id="whCode" placeholder="Code (optional)" aria-label="Code"><input type="text" id="whLoc" placeholder="Location (optional)" aria-label="Location"><button class="btn primary" data-addwh>Add warehouse</button></div>
+function renderSetup() {
+  const t = S.setupTab || 'warehouses';
+  let html = `<span class="eyebrow dash">Admin</span><h1 class="page-title" style="margin-bottom:16px">Setup</h1>
+    <nav class="subtabs" aria-label="Setup sections">${SETUP_TABS.map(([k, l]) => `<button class="subtab" data-setuptab="${k}" ${t === k ? 'aria-current="page"' : ''}>${l}</button>`).join('')}</nav>`;
+  html += t === 'users' ? panelUsers() : t === 'managers' ? panelManagers() : t === 'email' ? panelEmail()
+    : t === 'inspection' ? checklistEditor('insp') : t === 'cleaning' ? panelCleaning() : panelWarehouses();
+  main.innerHTML = html;
+}
+function panelWarehouses() {
+  const whs = S.config.warehouses || [];
+  return `<section class="panel"><span class="eyebrow dash">Warehouses</span><h2>Warehouse locations</h2><p class="hint">Supervisors inspect their assigned warehouses each week; cleaners clean them on their scheduled days. The Location groups warehouses in cleaner schedules.</p>
+    <div class="add-row"><input type="text" id="whName" placeholder="Warehouse name" aria-label="Warehouse name"><input type="text" id="whCode" placeholder="Code (optional)" aria-label="Code"><input type="text" id="whLoc" placeholder="Location, e.g. Al Quoz" aria-label="Location"><button class="btn primary" data-addwh>Add warehouse</button></div>
     ${whs.length ? '<ul class="rows">' + whs.map(w => S.editWh === w.id ? `<li><div class="add-row" style="margin:0"><input type="text" data-ew="name" value="${esc(w.name)}" aria-label="Name"><input type="text" data-ew="code" value="${esc(w.code || '')}" placeholder="Code" aria-label="Code"><input type="text" data-ew="location" value="${esc(w.location || '')}" placeholder="Location" aria-label="Location"><button class="btn primary" data-savewh="${esc(w.id)}">Save</button></div></li>` :
-      `<li class="${w.active === false ? 'inactive' : ''}"><div class="row-main"><div class="grow"><div class="t">${esc(w.name)}</div><div class="m">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${S.users ? (() => { const sv = supervisorsOf(w.id); return sv.length ? ` | Supervisor: ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor assigned</span>'; })() : ''}</div></div>
+      `<li class="${w.active === false ? 'inactive' : ''}"><div class="row-main"><div class="grow"><div class="t">${esc(w.name)}</div><div class="m">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${S.users ? (() => { const sv = supervisorsOf(w.id), cl = cleanersOf(w.id); return (sv.length ? ` | Supervisor: ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor</span>') + (cl.length ? ` | Cleaning: ${esc(cl.join(', '))}` : ''); })() : ''}</div></div>
       <label class="toggle"><input type="checkbox" data-activewh="${esc(w.id)}" ${w.active !== false ? 'checked' : ''}> Active</label>
       <button class="btn sm" data-editwh="${esc(w.id)}">Edit</button>
       <button class="btn sm danger ${S.armed === 'wh' + w.id ? 'armed' : ''}" data-delwh="${esc(w.id)}">${S.armed === 'wh' + w.id ? 'Confirm delete' : 'Delete'}</button></div></li>`).join('') + '</ul>' : '<p class="muted">No warehouses yet.</p>'}
   </section>`;
-
-  html += `<section class="panel"><span class="eyebrow dash">Managers</span><h2>Report recipients</h2><p class="hint">Managers receive the weekly report by email for the warehouses assigned to them. They don’t need an account.</p>
+}
+function panelManagers() {
+  const whs = S.config.warehouses || [], mgrs = S.config.managers || [];
+  return `<section class="panel"><span class="eyebrow dash">Managers</span><h2>Report recipients</h2><p class="hint">Managers receive the weekly inspection report by email for the warehouses assigned to them. They don’t need an account.</p>
     <div class="add-row mgr"><input type="text" id="mName" placeholder="Name" aria-label="Manager name"><input type="email" id="mEmail" placeholder="Email address" aria-label="Manager email"><button class="btn primary" data-addmgr>Add manager</button></div>
     <p class="err-text" id="mErr" hidden></p>
     ${mgrs.length ? '<ul class="rows">' + mgrs.map(m => {
@@ -505,71 +724,129 @@ function renderSetup() {
         ${all ? '' : whs.map(w => `<label><input type="checkbox" data-scope="${esc(m.id)}" value="${esc(w.id)}" ${m.scope.includes(w.id) ? 'checked' : ''}> ${esc(w.name)}</label>`).join('')}</div></li>`;
     }).join('') + '</ul>' : '<p class="muted">No managers yet.</p>'}
   </section>`;
-
-  html += `<section class="panel"><span class="eyebrow dash">Email</span><h2>Sender</h2>
-    <p class="hint">Reports are sent from this address. Your email provider must allow it: verify its domain in Resend, or use the mailbox your SMTP login belongs to.</p>
+}
+function panelEmail() {
+  const snd = S.sender || {}, mail = S.mail || {};
+  return `<section class="panel"><span class="eyebrow dash">Email</span><h2>Sender</h2>
+    <p class="hint">The weekly inspection report is sent from this address. Your email provider must allow it: verify its domain in Resend, or use the mailbox your SMTP login belongs to.</p>
     ${mail.provider ? `<div class="status-box ok"><strong>Email provider: ${mail.provider === 'resend' ? 'Resend' : 'SMTP'}</strong>${mail.appUrl ? `<p>Links in emails point to ${esc(mail.appUrl)}</p>` : '<p>Set APP_URL on the server so email links point to this app.</p>'}</div>` : `<div class="status-box bad"><strong>No email provider is configured on the server.</strong><p>Add RESEND_API_KEY, or SMTP_HOST, SMTP_USER and SMTP_PASS, in your host’s environment settings, then redeploy.</p></div>`}
     <div class="grid2" style="margin-bottom:8px"><input type="text" id="sName" value="${esc(snd.name || '')}" placeholder="Sender name, e.g. storage.ae Operations" aria-label="Sender name"><input type="email" id="sEmail" value="${esc(snd.email || '')}" placeholder="Sender email, e.g. facilities@storage.ae" aria-label="Sender email"></div>
     <div class="grid2"><input type="email" id="sReply" value="${esc(snd.replyTo || '')}" placeholder="Reply-to email (optional)" aria-label="Reply-to email"><div><button class="btn primary" data-savesender>Save sender</button></div></div>
     <p class="err-text" id="sErr" hidden></p>
     <div class="grid2" style="margin-top:16px"><input type="email" id="tTo" value="${esc(S.user.email)}" aria-label="Send test email to"><div><button class="btn" data-testmail ${mail.provider ? '' : 'disabled'}>Send test email</button></div></div>
   </section>`;
-
-  const users = S.users;
-  html += `<section class="panel"><span class="eyebrow dash">People</span><h2>Users</h2>
-    <p class="hint">Supervisors only see the Inspect page and only the warehouses ticked under their name. Admins see everything, including Reports and Setup. Give each person a temporary password; they can change it under Account.</p>
+}
+function scheduleSummary(u) {
+  const whMap = {}; (S.config.warehouses || []).forEach(w => { whMap[w.id] = w; });
+  const byDay = DAYS.map(() => new Set());
+  (u.schedule || []).forEach(r => (r.days || []).forEach(d => (r.warehouses || []).forEach(id => { if (whMap[id]) byDay[d - 1].add(whMap[id].name); })));
+  const parts = byDay.map((set, i) => set.size ? `${DAYS[i]}: ${[...set].join(', ')}` : '').filter(Boolean);
+  return parts.length ? parts.join(' | ') : '';
+}
+function panelUsers() {
+  const users = S.users, whs = S.config.warehouses || [];
+  const opt = (v, cur) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${ROLE_LABEL[v]}</option>`;
+  return `<section class="panel"><span class="eyebrow dash">People</span><h2>Users</h2>
+    <p class="hint"><strong>Admins</strong> see everything. <strong>Supervisors</strong> only see the Inspect page, for the warehouses ticked under their name. <strong>Cleaners</strong> only see their own daily cleaning jobs and schedule; set schedules in the Cleaning tab. Give each person a temporary password; they can change it under Account.</p>
     ${(() => { const un = activeWh().filter(w => S.users && !supervisorsOf(w.id).length); return S.users && un.length && S.users.some(u => u.role === 'supervisor') ? `<div class="status-box wait"><strong>${un.length} warehouse${un.length === 1 ? ' has' : 's have'} no supervisor:</strong><p>${esc(un.map(w => w.name).join(', '))}. Only admins can inspect ${un.length === 1 ? 'it' : 'them'} until you tick ${un.length === 1 ? 'it' : 'them'} under a supervisor.</p></div>` : ''; })()}
     <div class="add-row" style="grid-template-columns:1.1fr 1.4fr .9fr 1.1fr auto"><input type="text" id="uName" placeholder="Name" aria-label="User name"><input type="email" id="uEmail" placeholder="Email" aria-label="User email">
-      <select id="uRole" aria-label="Role"><option value="supervisor">Supervisor</option><option value="admin">Admin</option></select>
+      <select id="uRole" aria-label="Role">${opt('supervisor', 'supervisor')}${opt('cleaner')}${opt('admin')}</select>
       <input type="text" id="uPw" placeholder="Temporary password" aria-label="Temporary password"><button class="btn primary" data-adduser>Add user</button></div>
     <p class="err-text" id="uErr" hidden></p>
     ${!users ? '<p class="muted">Loading users…</p>' : '<ul class="rows">' + users.map(u => `<li class="${u.active ? '' : 'inactive'}"><div class="row-main"><div class="grow"><div class="t">${esc(u.name)}${u.id === S.user.id ? ' (you)' : ''}</div><div class="m">${esc(u.email)}</div></div>
-      <select data-urole="${u.id}" aria-label="Role for ${esc(u.name)}" ${u.id === S.user.id ? 'disabled' : ''}><option value="supervisor" ${u.role === 'supervisor' ? 'selected' : ''}>Supervisor</option><option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Admin</option></select>
+      <select data-urole="${u.id}" aria-label="Role for ${esc(u.name)}" ${u.id === S.user.id ? 'disabled' : ''}>${opt('supervisor', u.role)}${opt('cleaner', u.role)}${opt('admin', u.role)}</select>
       ${u.id === S.user.id ? '' : `<label class="toggle"><input type="checkbox" data-uactive="${u.id}" ${u.active ? 'checked' : ''}> Active</label>
       <button class="btn sm" data-upw="${u.id}">Reset password</button>
       <button class="btn sm danger ${S.armed === 'u' + u.id ? 'armed' : ''}" data-udel="${u.id}">${S.armed === 'u' + u.id ? 'Confirm delete' : 'Delete'}</button>`}</div>
       ${u.role === 'supervisor' ? `<div class="scope"><span class="muted" style="font-size:.8125rem">Warehouses:</span>${whs.length ? whs.map(w => `<label><input type="checkbox" data-uwh="${u.id}" value="${esc(w.id)}" ${(u.warehouses || []).includes(w.id) ? 'checked' : ''}> ${esc(w.name)}</label>`).join('') : '<span class="muted" style="font-size:.8125rem">Add warehouses first.</span>'}${whs.length && !(u.warehouses || []).length ? '<span class="warn-t" style="font-size:.8125rem">None assigned, so this supervisor sees nothing</span>' : ''}</div>` : ''}
+      ${u.role === 'cleaner' ? `<div class="scope"><span class="muted" style="font-size:.8125rem">Schedule:</span>${scheduleSummary(u) ? `<span style="font-size:.8125rem">${esc(scheduleSummary(u))}</span>` : '<span class="warn-t" style="font-size:.8125rem">No schedule yet</span>'}<button class="link-btn" data-setuptab="cleaning" data-focuscleaner="${u.id}">Edit schedule</button></div>` : ''}
       ${S.resetFor === u.id ? `<div class="grid2" style="margin-top:10px;max-width:560px"><input type="text" id="rPw" placeholder="New temporary password" aria-label="New password"><div><button class="btn primary" data-upwsave="${u.id}">Set password</button></div></div>` : ''}</li>`).join('') + '</ul>'}
   </section>`;
-
+}
+function checklistEditor(k) {
+  const clean = k === 'clean', secs = secsOf(k);
   const nPoints = secs.reduce((n, x) => n + x.items.length, 0);
-  html += `<section class="panel" id="clPanel"><span class="eyebrow dash">Checklist</span><h2>Checklist points</h2>
-    <p class="hint">Add, edit, reorder or remove points, or import them from Excel. Write each point as what good looks like (“Floor free of dust”), so Pass means OK. Changes apply to inspections started after you make them; inspections already started keep their checklist.</p>
-    <div class="send-actions"><label class="btn primary"><input class="vh" type="file" accept=".xlsx,.xls,.csv" data-import aria-label="Import checklist from Excel">Import from Excel</label>
-      ${secs.length ? '' : '<button class="btn" data-std>Use standard checklist</button>'}
+  const imp = S.importPreview && S.importPreview.kind === k;
+  let html = `<section class="panel" id="clPanel-${k}"><span class="eyebrow dash">${clean ? 'Cleaning' : 'Inspection'}</span><h2>${clean ? 'Cleaning checklist' : 'Inspection checklist'}</h2>
+    <p class="hint">${clean
+      ? 'The points a cleaner ticks off at every warehouse they clean. Write each as a task (“Mop floors”). Changes apply to work orders that haven’t been started yet.'
+      : 'Add, edit, reorder or remove points, or import them from Excel. Write each point as what good looks like (“Floor free of dust”), so Pass means OK. Changes apply to inspections started after you make them; inspections already started keep their checklist.'}</p>
+    <div class="send-actions"><label class="btn primary"><input class="vh" type="file" accept=".xlsx,.xls,.csv" data-import data-k="${k}" aria-label="Import checklist from Excel">Import from Excel</label>
+      ${secs.length ? '' : `<button class="btn" data-std data-k="${k}">Use standard ${clean ? 'cleaning ' : ''}checklist</button>`}
       <span class="muted" style="align-self:center;font-size:.875rem">${nPoints} point${nPoints === 1 ? '' : 's'} in ${secs.length} section${secs.length === 1 ? '' : 's'}</span></div>
-    ${S.importPreview ? importPreviewHTML() : ''}`;
+    ${imp ? importPreviewHTML() : ''}`;
   html += secs.map((sec, si) => {
     let lastG = null;
     return `<div class="ed-sec">
       <span class="eyebrow">Section ${String(si + 1).padStart(2, '0')} | ${sec.items.length} point${sec.items.length === 1 ? '' : 's'}</span>
-      <div class="ed-sec-head"><input type="text" data-sectitle="${esc(sec.id)}" value="${esc(sec.title)}" aria-label="Section title">
-      <button class="icon-btn" data-mvsec="${si}" data-dir="-1" aria-label="Move section up" ${si === 0 ? 'disabled' : ''}>↑</button>
-      <button class="icon-btn" data-mvsec="${si}" data-dir="1" aria-label="Move section down" ${si === secs.length - 1 ? 'disabled' : ''}>↓</button>
-      <button class="icon-btn ${S.armed === 's' + sec.id ? 'armed' : ''}" data-delsec="${esc(sec.id)}" aria-label="${S.armed === 's' + sec.id ? 'Click again to delete this section' : 'Delete section'}" title="${S.armed === 's' + sec.id ? 'Click again to delete' : 'Delete section'}">×</button></div>
+      <div class="ed-sec-head"><input type="text" data-sectitle="${esc(sec.id)}" data-k="${k}" value="${esc(sec.title)}" aria-label="Section title">
+      <button class="icon-btn" data-mvsec="${si}" data-k="${k}" data-dir="-1" aria-label="Move section up" ${si === 0 ? 'disabled' : ''}>↑</button>
+      <button class="icon-btn" data-mvsec="${si}" data-k="${k}" data-dir="1" aria-label="Move section down" ${si === secs.length - 1 ? 'disabled' : ''}>↓</button>
+      <button class="icon-btn ${S.armed === 's' + sec.id ? 'armed' : ''}" data-delsec="${esc(sec.id)}" data-k="${k}" aria-label="${S.armed === 's' + sec.id ? 'Click again to delete this section' : 'Delete section'}" title="${S.armed === 's' + sec.id ? 'Click again to delete' : 'Delete section'}">×</button></div>
       ${sec.items.map((it, ii) => {
         const g = it.group || '';
         const gh = g && g !== lastG ? `<div class="ed-grp">${esc(g)}</div>` : '';
         lastG = g;
         const open = S.edOpen[it.id];
-        const meta = [it.category, it.action].filter(Boolean).join(' | ');
-        return gh + `<div class="ed-item"><input type="text" data-itemtext="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.text)}" placeholder="Point, e.g. Floor free of dust" aria-label="Checklist point">
-          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-dir="-1" aria-label="Move point up" ${ii === 0 ? 'disabled' : ''}>↑</button>
-          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-dir="1" aria-label="Move point down" ${ii === sec.items.length - 1 ? 'disabled' : ''}>↓</button>
-          <button class="icon-btn ${open ? 'on' : ''}" data-itemmore="${esc(it.id)}" aria-expanded="${!!open}" aria-label="Group, category and corrective action" title="Group, category and corrective action">⋯</button>
-          <button class="icon-btn ${S.armed === 'i' + it.id ? 'armed' : ''}" data-delitem="${esc(it.id)}" data-of="${esc(sec.id)}" aria-label="${S.armed === 'i' + it.id ? 'Click again to remove this point' : 'Remove point'}" title="${S.armed === 'i' + it.id ? 'Click again to remove' : 'Remove point'}">×</button></div>
-          ${open ? `<div class="ed-more">
-            <input type="text" data-itemfield="group" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.group || '')}" placeholder="Group (sub-heading), optional" aria-label="Group">
-            <input type="text" data-itemfield="category" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.category || '')}" placeholder="Category, optional" aria-label="Category">
-            <input type="text" data-itemfield="action" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" value="${esc(it.action || '')}" placeholder="Corrective action shown when it fails, optional" aria-label="Corrective action"></div>`
+        const meta = clean ? '' : [it.category, it.action].filter(Boolean).join(' | ');
+        return gh + `<div class="ed-item"><input type="text" data-itemtext="${esc(it.id)}" data-of="${esc(sec.id)}" data-k="${k}" value="${esc(it.text)}" placeholder="${clean ? 'Task, e.g. Mop floors' : 'Point, e.g. Floor free of dust'}" aria-label="Checklist point">
+          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-k="${k}" data-dir="-1" aria-label="Move point up" ${ii === 0 ? 'disabled' : ''}>↑</button>
+          <button class="icon-btn" data-mvitem="${ii}" data-of="${esc(sec.id)}" data-k="${k}" data-dir="1" aria-label="Move point down" ${ii === sec.items.length - 1 ? 'disabled' : ''}>↓</button>
+          <button class="icon-btn ${open ? 'on' : ''}" data-itemmore="${esc(it.id)}" data-k="${k}" aria-expanded="${!!open}" aria-label="${clean ? 'Group' : 'Group, category and corrective action'}" title="${clean ? 'Group (sub-heading)' : 'Group, category and corrective action'}">⋯</button>
+          <button class="icon-btn ${S.armed === 'i' + it.id ? 'armed' : ''}" data-delitem="${esc(it.id)}" data-of="${esc(sec.id)}" data-k="${k}" aria-label="${S.armed === 'i' + it.id ? 'Click again to remove this point' : 'Remove point'}" title="${S.armed === 'i' + it.id ? 'Click again to remove' : 'Remove point'}">×</button></div>
+          ${open ? `<div class="ed-more ${clean ? 'one' : ''}">
+            <input type="text" data-itemfield="group" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" data-k="${k}" value="${esc(it.group || '')}" placeholder="Group (sub-heading), optional" aria-label="Group">
+            ${clean ? '' : `<input type="text" data-itemfield="category" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" data-k="${k}" value="${esc(it.category || '')}" placeholder="Category, optional" aria-label="Category">
+            <input type="text" data-itemfield="action" data-id="${esc(it.id)}" data-of="${esc(sec.id)}" data-k="${k}" value="${esc(it.action || '')}" placeholder="Corrective action shown when it fails, optional" aria-label="Corrective action">`}</div>`
           : meta ? `<div class="ed-meta">${esc(meta)}</div>` : ''}`;
       }).join('')}
-      <button class="link-btn" data-additem="${esc(sec.id)}">+ Add point</button></div>`;
+      <button class="link-btn" data-additem="${esc(sec.id)}" data-k="${k}">+ Add point</button></div>`;
   }).join('');
-  html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px"><button class="btn" data-addsec>+ Add section</button>
-    ${secs.length ? `<button class="btn ghost ${S.armed === 'std' ? 'danger armed' : ''}" data-std>${S.armed === 'std' ? 'Confirm: replace with standard' : 'Restore standard checklist'}</button>` : ''}</div></section>`;
-  main.innerHTML = html;
+  html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px"><button class="btn" data-addsec data-k="${k}">+ Add section</button>
+    ${secs.length ? `<button class="btn ghost ${S.armed === 'std' + k ? 'danger armed' : ''}" data-std data-k="${k}">${S.armed === 'std' + k ? 'Confirm: replace with standard' : 'Restore standard checklist'}</button>` : ''}</div></section>`;
+  return html;
 }
+function panelCleaning() {
+  const cleaners = (S.users || []).filter(u => u.role === 'cleaner');
+  const whs = (S.config.warehouses || []).filter(w => w.active !== false);
+  const byLoc = {};
+  whs.forEach(w => { const l = w.location || 'No location'; (byLoc[l] = byLoc[l] || []).push(w); });
+  const locs = Object.keys(byLoc).sort();
+  let html = `<section class="panel"><span class="eyebrow dash">Cleaning</span><h2>Cleaner schedules</h2>
+    <p class="hint">Each schedule line is a set of days and the warehouses to clean on those days. A cleaner can have as many lines as needed, for example Mon and Wed at Al Quoz, Tue at Jebel Ali. Every scheduled warehouse becomes a work order on that day. Add cleaners in the Users tab with the role Cleaner.</p>`;
+  if (!S.users) html += '<p class="muted">Loading…</p>';
+  else if (!cleaners.length) html += `<div class="empty" style="margin:0"><h2>No cleaners yet</h2><p>Add a user with the role Cleaner, then set their schedule here.</p><button class="btn primary" data-setuptab="users">Go to Users</button></div>`;
+  else if (!whs.length) html += '<p class="muted">Add warehouses first.</p>';
+  else html += cleaners.map(u => {
+    const rows = u.schedule || [];
+    return `<div class="cl-card ${u.active ? '' : 'inactive'}" id="cleaner-${u.id}"><div class="row-main"><div class="grow"><div class="t">${esc(u.name)}${u.active ? '' : ' (inactive)'}</div><div class="m">${esc(scheduleSummary(u)) || '<span class="warn-t">No schedule yet</span>'}</div></div>
+      <button class="btn sm" data-addsched="${u.id}">+ Add schedule line</button></div>
+      ${rows.map((r, ri) => `<div class="sched">
+        <div class="sched-head"><span class="eyebrow">Line ${ri + 1}</span><button class="icon-btn ${S.armed === 'sc' + u.id + ':' + ri ? 'armed' : ''}" data-delsched="${u.id}" data-row="${ri}" aria-label="Remove schedule line" title="${S.armed === 'sc' + u.id + ':' + ri ? 'Click again to remove' : 'Remove line'}">×</button></div>
+        <div class="days" role="group" aria-label="Days">${DAYS.map((d, i) => `<button type="button" class="chip day" data-schedday="${u.id}" data-row="${ri}" data-day="${i + 1}" aria-pressed="${(r.days || []).includes(i + 1)}">${d}</button>`).join('')}</div>
+        <div class="sched-wh">${locs.map(l => `<div class="loc"><span class="loc-t">${esc(l)}</span>${byLoc[l].map(w => `<label><input type="checkbox" data-schedwh="${u.id}" data-row="${ri}" value="${esc(w.id)}" ${(r.warehouses || []).includes(w.id) ? 'checked' : ''}> ${esc(w.name)}</label>`).join('')}</div>`).join('')}</div>
+        ${!(r.days || []).length || !(r.warehouses || []).length ? `<p class="warn-t" style="font-size:.8125rem;margin:6px 0 0">Pick at least one day and one warehouse.</p>` : ''}
+      </div>`).join('')}
+    </div>`;
+  }).join('');
+  html += `</section>`;
+  html += checklistEditor('clean');
+  return html;
+}
+function cleanersOf(whId) {
+  return (S.users || []).filter(u => u.role === 'cleaner' && u.active && (u.schedule || []).some(r => (r.warehouses || []).includes(whId) && (r.days || []).length)).map(u => u.name);
+}
+function editSchedule(uid_, fn) {
+  const u = (S.users || []).find(x => x.id === +uid_); if (!u) return;
+  const sched = clone(u.schedule || []);
+  fn(sched);
+  u.schedule = sched;
+  renderSetup();
+  clearTimeout(S.schedT && S.schedT[uid_]); S.schedT = S.schedT || {};
+  S.schedT[uid_] = setTimeout(() => api('PUT', '/api/users/' + uid_, { schedule: u.schedule }).then(r => { u.schedule = r.user.schedule; setSave('saved'); }).catch(e => toast(e.message)), 500);
+  setSave('saving');
+}
+
 /* ---------- Checklist import (Excel / CSV) ---------- */
 function loadXLSX() {
   if (window.XLSX) return Promise.resolve();
@@ -629,7 +906,7 @@ function parseChecklist(rows) {
   const sections = secs.filter(x => x.items.length);
   return { sections, count: sections.reduce((n, x) => n + x.items.length, 0), problem, dupes };
 }
-async function importFile(file) {
+async function importFile(file, k) {
   try {
     toast('Reading ' + file.name + '…');
     await loadXLSX();
@@ -638,13 +915,14 @@ async function importFile(file) {
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: true, blankrows: false });
     const r = parseChecklist(rows);
     if (!r.count) throw new Error('No checklist points found in that file. Put one point per row, with a “Checkpoint” column header.');
-    S.importPreview = Object.assign(r, { fileName: file.name });
+    S.importPreview = Object.assign(r, { fileName: file.name, kind: k || 'insp' });
+    if (k === 'clean') S.importPreview.problem = [];
     renderSetup();
     const el = document.getElementById('impPreview'); el && el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   } catch (e) { toast(e.message || 'Couldn’t read that file.'); }
 }
 function importPreviewHTML() {
-  const p = S.importPreview, has = (S.config.sections || []).length;
+  const p = S.importPreview, has = secsOf(p.kind).length;
   return `<div class="imp" id="impPreview"><span class="eyebrow dash">Import preview</span>
     <h3 style="font-size:1.25rem;margin:6px 0 4px">${esc(p.fileName)}: ${p.count} points in ${p.sections.length} section${p.sections.length === 1 ? '' : 's'}</h3>
     <ul class="imp-list">${p.sections.map(x => { const groups = new Set(x.items.map(i => i.group).filter(Boolean)).size; return `<li><strong>${esc(x.title)}</strong><span class="muted">${x.items.length} point${x.items.length === 1 ? '' : 's'}${groups ? `, ${groups} group${groups === 1 ? '' : 's'}` : ''}</span></li>`; }).join('')}</ul>
@@ -657,11 +935,12 @@ function importPreviewHTML() {
 }
 function applyImport(mode) {
   const p = S.importPreview; if (!p) return;
-  if (mode === 'replace') S.config.sections = p.sections;
+  if (mode === 'replace') setSecs(p.kind, p.kind === 'clean' ? p.sections.map(x => ({ id: x.id, title: x.title, items: x.items.map(i => ({ id: i.id, text: i.text, group: i.group })) })) : p.sections);
   else {
+    const cur = secsOf(p.kind);
     p.sections.forEach(ns => {
-      const ex = S.config.sections.find(x => x.title.toLowerCase() === ns.title.toLowerCase());
-      if (!ex) { S.config.sections.push(ns); return; }
+      const ex = cur.find(x => x.title.toLowerCase() === ns.title.toLowerCase());
+      if (!ex) { cur.push(ns); return; }
       const have = new Set(ex.items.map(i => i.text.toLowerCase()));
       ns.items.forEach(i => { if (!have.has(i.text.toLowerCase())) ex.items.push(i); });
     });
@@ -702,7 +981,8 @@ async function addUser() {
   const err = document.getElementById('uErr');
   try {
     await api('POST', '/api/users', { name: document.getElementById('uName').value, email: document.getElementById('uEmail').value, role: document.getElementById('uRole').value, password: document.getElementById('uPw').value });
-    toast(document.getElementById('uRole').value === 'supervisor' ? 'User added. Now tick their warehouses below, then share their email and temporary password.' : 'User added. Share their email and temporary password with them.');
+    const rl = document.getElementById('uRole').value;
+    toast(rl === 'supervisor' ? 'User added. Now tick their warehouses below, then share their email and temporary password.' : rl === 'cleaner' ? 'Cleaner added. Set their schedule in the Cleaning tab, then share their email and temporary password.' : 'User added. Share their email and temporary password with them.');
     await loadUsers(); renderSetup();
   } catch (e) { err.hidden = false; err.textContent = e.message; }
 }
@@ -716,6 +996,14 @@ main.addEventListener('click', e => {
   const t = e.target.closest('button, a, img[data-view]'); if (!t) return;
   const ds = t.dataset;
   if ('dologin' in ds) return doLogin();
+  if (ds.tabGo) return goTab(ds.tabGo);
+  if (ds.openjob) return openJob(ds.openjob);
+  if ('backjob' in ds) { flushAll(); closeJob(); render(); window.scrollTo(0, 0); return; }
+  if ('reopenjob' in ds) return reopenJob();
+  if (ds.rmjobphoto && S.job) { S.job.photos = S.job.photos.filter(p => p !== ds.rmjobphoto); saveJob(); renderJob(); return; }
+  if (ds.recq) { const [a, b] = ds.recq.split('|'); S.recF.from = a; S.recF.to = b; S.rec = null; renderCleaning(); loadRecords().then(renderCleaning); return; }
+  if (ds.recopen) { S.recOpen = S.recOpen === +ds.recopen ? null : +ds.recopen; renderCleaning(); return; }
+  if (ds.recreopen) { api('POST', `/api/cleaning/jobs/${ds.recreopen}/reopen`).then(() => loadRecords()).then(() => { renderCleaning(); toast('Work order reopened'); }).catch(e => toast(e.message)); return; }
   if ('dosetup' in ds) return doSetup();
   if ('signout' in ds) return signOut();
   if ('chpw' in ds) return changePassword();
@@ -739,6 +1027,17 @@ main.addEventListener('click', e => {
   if ('reopen' in ds) return reopenDraft();
   if ('sendnow' in ds) return sendNow();
   // Setup
+  if (ds.setuptab) {
+    S.setupTab = ds.setuptab; S.armed = null; S.editWh = null; renderSetup(); window.scrollTo(0, 0);
+    if (ds.focuscleaner) { const el = document.getElementById('cleaner-' + ds.focuscleaner); el && el.scrollIntoView({ block: 'start' }); }
+    return;
+  }
+  if (ds.addsched) return editSchedule(ds.addsched, sc => sc.push({ id: uid(), days: [], warehouses: [] }));
+  if (ds.delsched) {
+    if (S.armed !== 'sc' + ds.delsched + ':' + ds.row) { arm('sc' + ds.delsched + ':' + ds.row); renderSetup(); return; }
+    S.armed = null; return editSchedule(ds.delsched, sc => sc.splice(+ds.row, 1));
+  }
+  if (ds.schedday) return editSchedule(ds.schedday, sc => { const r = sc[+ds.row]; const d = +ds.day; r.days = r.days.includes(d) ? r.days.filter(x => x !== d) : [...r.days, d].sort(); });
   if ('addwh' in ds) return addWarehouse();
   if (ds.editwh) { S.editWh = ds.editwh; renderSetup(); const f = main.querySelector('[data-ew="name"]'); f && f.focus(); return; }
   if (ds.savewh) {
@@ -770,46 +1069,57 @@ main.addEventListener('click', e => {
     return;
   }
   if ('std' in ds) {
-    if ((S.config.sections || []).length && S.armed !== 'std') { arm('std'); renderSetup(); return; }
-    S.config.sections = standardSections(); S.armed = null; S.importPreview = null; saveConfig(0); renderSetup(); toast('Standard checklist loaded'); return;
+    const k = ds.k || 'insp';
+    if (secsOf(k).length && S.armed !== 'std' + k) { arm('std' + k); renderSetup(); return; }
+    setSecs(k, k === 'clean' ? FC.standardCleaning() : standardSections()); S.armed = null; S.importPreview = null; saveConfig(0); renderSetup(); toast('Standard checklist loaded'); return;
   }
-  if ('addsec' in ds) { const s = { id: uid(), title: 'New section', items: [{ id: uid(), text: '' }] }; S.config.sections.push(s); saveConfig(); renderSetup(); const f = main.querySelector(`[data-sectitle="${s.id}"]`); f && (f.focus(), f.select()); return; }
-  if (ds.mvsec != null) { const i = +ds.mvsec, j = i + (+ds.dir), a = S.config.sections; if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; saveConfig(); renderSetup(); return; }
+  if ('addsec' in ds) { const s = { id: uid(), title: 'New section', items: [{ id: uid(), text: '' }] }; secsOf(ds.k).push(s); saveConfig(); renderSetup(); const f = main.querySelector(`[data-sectitle="${s.id}"]`); f && (f.focus(), f.select()); return; }
+  if (ds.mvsec != null) { const i = +ds.mvsec, j = i + (+ds.dir), a = secsOf(ds.k); if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; saveConfig(); renderSetup(); return; }
   if (ds.delsec) {
     if (S.armed !== 's' + ds.delsec) { arm('s' + ds.delsec); renderSetup(); return; }
-    S.config.sections = S.config.sections.filter(s => s.id !== ds.delsec); S.armed = null; saveConfig(0); renderSetup(); return;
+    setSecs(ds.k, secsOf(ds.k).filter(s => s.id !== ds.delsec)); S.armed = null; saveConfig(0); renderSetup(); return;
   }
-  if ('impreplace' in ds) { if ((S.config.sections || []).length && S.armed !== 'impReplace') { arm('impReplace'); renderSetup(); return; } return applyImport('replace'); }
+  if ('impreplace' in ds) { if (S.importPreview && secsOf(S.importPreview.kind).length && S.armed !== 'impReplace') { arm('impReplace'); renderSetup(); return; } return applyImport('replace'); }
   if ('impadd' in ds) return applyImport('add');
   if ('impcancel' in ds) { S.importPreview = null; renderSetup(); return; }
   if (ds.itemmore) { S.edOpen[ds.itemmore] = !S.edOpen[ds.itemmore]; renderSetup(); const f = main.querySelector(`[data-itemfield="group"][data-id="${CSS.escape(ds.itemmore)}"]`); f && f.focus(); return; }
-  if (ds.mvitem != null) { const sec = S.config.sections.find(x => x.id === ds.of), i = +ds.mvitem, j = i + (+ds.dir); if (!sec || j < 0 || j >= sec.items.length) return; [sec.items[i], sec.items[j]] = [sec.items[j], sec.items[i]]; saveConfig(); renderSetup(); const f = main.querySelector(`[data-mvitem="${j}"][data-of="${CSS.escape(ds.of)}"][data-dir="${ds.dir}"]`); f && !f.disabled && f.focus(); return; }
-  if (ds.additem) { const sec = S.config.sections.find(s => s.id === ds.additem); const last = sec.items[sec.items.length - 1]; const it = { id: uid(), text: '' }; if (last && last.group) it.group = last.group; sec.items.push(it); saveConfig(); renderSetup(); const f = main.querySelector(`[data-itemtext="${it.id}"]`); f && f.focus(); return; }
+  if (ds.mvitem != null) { const sec = secsOf(ds.k).find(x => x.id === ds.of), i = +ds.mvitem, j = i + (+ds.dir); if (!sec || j < 0 || j >= sec.items.length) return; [sec.items[i], sec.items[j]] = [sec.items[j], sec.items[i]]; saveConfig(); renderSetup(); const f = main.querySelector(`[data-mvitem="${j}"][data-of="${CSS.escape(ds.of)}"][data-dir="${ds.dir}"]`); f && !f.disabled && f.focus(); return; }
+  if (ds.additem) { const sec = secsOf(ds.k).find(s => s.id === ds.additem); const last = sec.items[sec.items.length - 1]; const it = { id: uid(), text: '' }; if (last && last.group) it.group = last.group; sec.items.push(it); saveConfig(); renderSetup(); const f = main.querySelector(`[data-itemtext="${it.id}"]`); f && f.focus(); return; }
   if (ds.delitem) {
     if (S.armed !== 'i' + ds.delitem) { arm('i' + ds.delitem); renderSetup(); return; }
-    const sec = S.config.sections.find(s => s.id === ds.of); sec.items = sec.items.filter(i => i.id !== ds.delitem); S.armed = null; saveConfig(); renderSetup(); toast('Point removed'); return;
+    const sec = secsOf(ds.k).find(s => s.id === ds.of); sec.items = sec.items.filter(i => i.id !== ds.delitem); S.armed = null; saveConfig(); renderSetup(); toast('Point removed'); return;
   }
 });
 document.body.addEventListener('click', e => {
   const t = e.target.closest('.cl-bar button'); if (!t) return;
   if ('submit' in t.dataset) submitDraft(t);
+  if ('completejob' in t.dataset) completeJob(t);
+  if ('backjob' in t.dataset) { flushAll(); closeJob(); render(); window.scrollTo(0, 0); }
   if ('back' in t.dataset) { closeDraft(); render(); window.scrollTo(0, 0); }
 });
 main.addEventListener('input', e => {
   const t = e.target, ds = t.dataset;
+  if ('jobnote' in ds && S.job) { S.job.note = t.value; saveJob(1200); return; }
   if ('note' in ds && S.draft) {
     const id = t.closest('[data-item]').dataset.item;
     const a = S.draft.answers[id] || (S.draft.answers[id] = {});
     a.note = t.value; saveDraft(900); updateProgress(); return;
   }
-  if (ds.sectitle) { const s = S.config.sections.find(x => x.id === ds.sectitle); s.title = t.value; saveConfig(); return; }
-  if (ds.itemtext) { const s = S.config.sections.find(x => x.id === ds.of); const it = s.items.find(x => x.id === ds.itemtext); it.text = t.value; saveConfig(); return; }
-  if (ds.itemfield) { const s = S.config.sections.find(x => x.id === ds.of); const it = s && s.items.find(x => x.id === ds.id); if (!it) return; const v = t.value; if (v.trim()) it[ds.itemfield] = v; else delete it[ds.itemfield]; saveConfig(); return; }
+  if (ds.sectitle) { const s = secsOf(ds.k).find(x => x.id === ds.sectitle); s.title = t.value; saveConfig(); return; }
+  if (ds.itemtext) { const s = secsOf(ds.k).find(x => x.id === ds.of); const it = s.items.find(x => x.id === ds.itemtext); it.text = t.value; saveConfig(); return; }
+  if (ds.itemfield) { const s = secsOf(ds.k).find(x => x.id === ds.of); const it = s && s.items.find(x => x.id === ds.id); if (!it) return; const v = t.value; if (v.trim()) it[ds.itemfield] = v; else delete it[ds.itemfield]; saveConfig(); return; }
 });
 main.addEventListener('change', e => {
   const t = e.target, ds = t.dataset;
   if ('photo' in ds) { const id = t.closest('[data-item]').dataset.item; addPhotos(id, [...t.files]); t.value = ''; return; }
-  if ('import' in ds) { const f = t.files && t.files[0]; t.value = ''; if (f) importFile(f); return; }
+  if ('jobphoto' in ds) { addJobPhotos([...t.files]); t.value = ''; return; }
+  if (ds.tick && S.job) { if (t.checked) S.job.checks[ds.tick] = true; else delete S.job.checks[ds.tick]; t.closest('.tick').classList.toggle('on', t.checked); saveJob(800); updateJobProgress(); return; }
+  if (ds.recf) {
+    S.recF[ds.recf] = t.value;
+    if (ds.recf === 'from' || ds.recf === 'to') { S.rec = null; renderCleaning(); loadRecords().then(renderCleaning); } else renderCleaning();
+    return;
+  }
+  if ('import' in ds) { const f = t.files && t.files[0]; t.value = ''; if (f) importFile(f, ds.k); return; }
   if (ds.activewh) { const w = S.config.warehouses.find(x => x.id === ds.activewh); w.active = t.checked; saveConfig(0); renderSetup(); return; }
   if (ds.scopeall) { const m = S.config.managers.find(x => x.id === ds.scopeall); m.scope = t.checked ? 'all' : []; saveConfig(0); renderSetup(); return; }
   if (ds.scope) { const m = S.config.managers.find(x => x.id === ds.scope); const set = new Set(m.scope); t.checked ? set.add(t.value) : set.delete(t.value); m.scope = [...set]; saveConfig(0); return; }
@@ -818,6 +1128,7 @@ main.addEventListener('change', e => {
     const ids = [...main.querySelectorAll(`input[data-uwh="${ds.uwh}"]:checked`)].map(x => x.value);
     return updateUser(ds.uwh, { warehouses: ids }, 'Warehouses updated');
   }
+  if (ds.schedwh) return editSchedule(ds.schedwh, sc => { const r = sc[+ds.row]; const set = new Set(r.warehouses); t.checked ? set.add(t.value) : set.delete(t.value); r.warehouses = [...set]; });
   if (ds.uactive) return updateUser(ds.uactive, { active: t.checked }, t.checked ? 'User activated' : 'User deactivated and signed out');
 });
 main.addEventListener('keydown', e => {
@@ -837,7 +1148,9 @@ async function changeWeek(n) {
 }
 setInterval(async () => {
   if (!S.user || S.draft || document.hidden) return;
-  if (S.tab === 'setup' || S.tab === 'account') return;
+  if (S.tab === 'setup' || S.tab === 'account' || S.job) return;
+  if (isCleanerUser()) { await loadCleaner(); if (!S.job && (S.tab === 'today')) render(); return; }
+  if (S.tab === 'cleaning') { await loadRecords(); if (S.tab === 'cleaning') renderCleaning(); return; }
   await loadWeek(); if (!S.draft && (S.tab === 'inspect' || S.tab === 'reports')) render();
 }, 30000);
 window.addEventListener('beforeunload', e => { if (Object.keys(writers).some(pending)) { e.preventDefault(); e.returnValue = ''; } });
@@ -845,7 +1158,7 @@ window.addEventListener('beforeunload', e => { if (Object.keys(writers).some(pen
 
 /* ---------- Boot ---------- */
 (async function boot() {
-  const m = location.hash.match(/^#(reports|setup|account)(?:\/(\d{4}-W\d{2}))?/);
+  const m = location.hash.match(/^#(reports|setup|account|cleaning|today|schedule)(?:\/(\d{4}-W\d{2}))?/);
   if (m) { S.tab = m[1]; if (m[2] && m[2] <= THIS_WEEK) S.week = m[2]; }
   try {
     const r = await api('GET', '/api/me');
