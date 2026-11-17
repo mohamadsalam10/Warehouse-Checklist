@@ -58,7 +58,7 @@ async function startSession(req, res, userId) {
   await q(`INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, now() + interval '${SESSION_DAYS} days')`, [sha(token), userId]);
   setSessionCookie(req, res, token, SESSION_DAYS * 86400);
 }
-const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, warehouses: Array.isArray(u.warehouses) ? u.warehouses : [], schedule: Array.isArray(u.schedule) ? u.schedule : [] });
+const publicUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, warehouses: Array.isArray(u.warehouses) ? u.warehouses : [], schedule: cleanSchedule(u.schedule) });
 // Supervisors only see and inspect the warehouses assigned to them; admins see all.
 const canInspect = (u, whId) => u.role === 'admin' || (u.role === 'supervisor' && Array.isArray(u.warehouses) && u.warehouses.includes(whId));
 const ROLES = ['admin', 'supervisor', 'cleaner'];
@@ -167,7 +167,7 @@ app.put('/api/users/:id', admin, wrap(async (req, res) => {
   let hash = u.password_hash;
   if (b.password) { if (String(b.password).length < 8) fail(400, 'Use a password of at least 8 characters.'); hash = hashPassword(String(b.password)); }
   const whs = b.warehouses !== undefined ? cleanWhList(b.warehouses) : (Array.isArray(u.warehouses) ? u.warehouses : []);
-  const sched = b.schedule !== undefined ? cleanSchedule(b.schedule) : (Array.isArray(u.schedule) ? u.schedule : []);
+  const sched = b.schedule !== undefined ? cleanSchedule(b.schedule) : cleanSchedule(u.schedule);
   const out = await q('UPDATE users SET name = $1, role = $2, active = $3, password_hash = $4, warehouses = $5, schedule = $6 WHERE id = $7 RETURNING *', [name, role, active, hash, JSON.stringify(whs), JSON.stringify(sched), id]);
   if (b.schedule !== undefined || b.role !== undefined || typeof b.active === 'boolean') await syncDay(localDate(), { prune: true });
   if (!active || b.password) await q('DELETE FROM sessions WHERE user_id = $1', [id]);
@@ -445,12 +445,32 @@ const localDate = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZon
 const isDateKey = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(Date.parse(v + 'T00:00:00Z'));
 const weekdayOf = date => new Date(date + 'T00:00:00Z').getUTCDay() || 7; // 1 = Monday ... 7 = Sunday
 const addDays = (date, n) => { const d = new Date(date + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+/*
+ * A cleaner's schedule:
+ *   { mode: 'recurring' | 'weekly',
+ *     days:  { 1: [warehouse ids], ... 7: [...] }          // recurring: the same every week (1 = Monday)
+ *     weeks: { '2026-W47': { 1: [...], ... } } }          // weekly: one plan per ISO week; ends with the week
+ * Old schedules (a list of {days, warehouses} lines) are converted to recurring.
+ */
+function cleanDays(o) {
+  const out = {};
+  for (let d = 1; d <= 7; d++) { const l = cleanWhList(o && (o[d] || o[String(d)])); if (l.length) out[d] = l; }
+  return out;
+}
 function cleanSchedule(v) {
-  return (Array.isArray(v) ? v : []).slice(0, 50).map(r => ({
-    id: idOk(r && r.id) ? r.id : crypto.randomBytes(5).toString('hex'),
-    days: [...new Set((Array.isArray(r && r.days) ? r.days : []).map(Number).filter(d => d >= 1 && d <= 7))].sort(),
-    warehouses: cleanWhList(r && r.warehouses)
-  }));
+  if (Array.isArray(v)) {
+    const days = {};
+    v.forEach(r => (r && Array.isArray(r.days) ? r.days : []).forEach(d => { days[d] = [...new Set([...(days[d] || []), ...((r && r.warehouses) || [])])]; }));
+    return { mode: 'recurring', days: cleanDays(days), weeks: {} };
+  }
+  const weeks = {};
+  Object.keys((v && v.weeks) || {}).filter(FC.isWeekKey).sort().slice(-60).forEach(k => { const d = cleanDays(v.weeks[k]); if (Object.keys(d).length) weeks[k] = d; });
+  return { mode: v && v.mode === 'weekly' ? 'weekly' : 'recurring', days: cleanDays(v && v.days), weeks };
+}
+const isoWeekOf = date => { const [y, m, d] = date.split('-').map(Number); return FC.isoWeek(new Date(y, m - 1, d)); };
+function warehousesFor(schedule, date) {
+  const s = cleanSchedule(schedule), wd = weekdayOf(date);
+  return s.mode === 'weekly' ? ((s.weeks[isoWeekOf(date)] || {})[wd] || []) : (s.days[wd] || []);
 }
 const isCleaner = (req, res, next) => req.user && req.user.role === 'cleaner' ? next() : next(new HttpError(403, 'Only cleaners can do this.'));
 
@@ -464,8 +484,7 @@ async function syncDay(date, { prune }) {
   const cleaners = (await q(`SELECT id, schedule FROM users WHERE role = 'cleaner' AND active`)).rows;
   const keep = new Set();
   for (const c of cleaners) {
-    const want = new Set();
-    (c.schedule || []).forEach(r => { if ((r.days || []).includes(wd)) (r.warehouses || []).forEach(id => { if (whMap[id]) want.add(id); }); });
+    const want = new Set(warehousesFor(c.schedule, date).filter(id => whMap[id]));
     for (const id of want) {
       keep.add(c.id + ':' + id);
       const w = whMap[id];
@@ -525,16 +544,16 @@ app.get('/api/cleaner/today', isCleaner, wrap(async (req, res) => {
   const jobs = (await q(`SELECT j.*, $3::text AS cleaner_name FROM cleaning_jobs j WHERE job_date = $1 AND cleaner_id = $2 ORDER BY warehouse_location, warehouse_name`, [today, req.user.id, req.user.name])).rows.map(rowToJob);
   const cfg = await getConfig();
   const whMap = {}; cfg.warehouses.forEach(w => { whMap[w.id] = w; });
-  const schedule = (req.user.schedule || []).map(r => ({ days: r.days, warehouses: (r.warehouses || []).filter(id => whMap[id] && whMap[id].active !== false).map(id => ({ id, name: whMap[id].name, location: whMap[id].location || '' })) }));
+  const sched = cleanSchedule(req.user.schedule);
   // Next 7 days from the schedule (today included), so cleaners can plan ahead
   const upcoming = [];
   for (let i = 0; i < 7; i++) {
-    const d = addDays(today, i), wd = weekdayOf(d), seen = new Set(), list = [];
-    schedule.forEach(r => { if ((r.days || []).includes(wd)) r.warehouses.forEach(w => { if (!seen.has(w.id)) { seen.add(w.id); list.push(w); } }); });
+    const d = addDays(today, i), wd = weekdayOf(d);
+    const list = warehousesFor(sched, d).filter(id => whMap[id] && whMap[id].active !== false).map(id => ({ id, name: whMap[id].name, location: whMap[id].location || '' }));
     list.sort((a, b) => (a.location || '').localeCompare(b.location || '') || a.name.localeCompare(b.name));
     upcoming.push({ date: d, weekday: wd, warehouses: list });
   }
-  res.json({ date: today, weekday: weekdayOf(today), jobs, schedule, upcoming, checklist: (cfg.cleaning && cfg.cleaning.sections) || [] });
+  res.json({ date: today, weekday: weekdayOf(today), jobs, mode: sched.mode, upcoming, checklist: (cfg.cleaning && cfg.cleaning.sections) || [] });
 }));
 async function saveJob(req, complete) {
   const j = await ownJob(req);

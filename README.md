@@ -107,3 +107,14 @@ Open http://localhost:3000.
 - If sending fails (for example the sender domain isn't verified), Reports shows the error and an admin can click **Send now** after fixing it.
 - Photos in the email body load through signed links, so managers can see them without signing in.
   The attached HTML report has every photo embedded (skipped if the photos exceed 15 MB in total).
+
+## Cleaning
+- **Cleaners** sign in and see only **Today** (their work orders) and **My schedule** (the next 7 days).
+- **Schedules** are set per cleaner in **Setup > Cleaning** on a grid: warehouses down the side, Mon to Sun across. Tick any warehouse on any day.
+  - **Recurring:** one grid that repeats every week.
+  - **Week by week:** a grid per week (use ‹ › to move between weeks, **Copy week** to reuse the previous one). A week's plan ends with that week.
+- Every ticked warehouse becomes a **work order** on that day. The cleaner ticks the cleaning points, can add photos and a note, and marks it done.
+  If points are left unticked, a note is required.
+- **Records** are in the **Cleaning** tab (admins): filter by dates, cleaner, warehouse and status (Done, In progress, Not started, Not finished, Missed).
+  There is no cleaning email.
+- Work orders are created when anyone opens the app; if nobody does for a while, up to 14 days are filled in the next time someone does.

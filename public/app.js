@@ -736,12 +736,19 @@ function panelEmail() {
     <div class="grid2" style="margin-top:16px"><input type="email" id="tTo" value="${esc(S.user.email)}" aria-label="Send test email to"><div><button class="btn" data-testmail ${mail.provider ? '' : 'disabled'}>Send test email</button></div></div>
   </section>`;
 }
+function normSched(v) {
+  // Same shape as the server: { mode, days: {1..7: [ids]}, weeks: {'YYYY-Www': {1..7: [ids]}} }
+  if (!v || Array.isArray(v)) return { mode: 'recurring', days: {}, weeks: {} };
+  return { mode: v.mode === 'weekly' ? 'weekly' : 'recurring', days: v.days || {}, weeks: v.weeks || {} };
+}
 function scheduleSummary(u) {
-  const whMap = {}; (S.config.warehouses || []).forEach(w => { whMap[w.id] = w; });
-  const byDay = DAYS.map(() => new Set());
-  (u.schedule || []).forEach(r => (r.days || []).forEach(d => (r.warehouses || []).forEach(id => { if (whMap[id]) byDay[d - 1].add(whMap[id].name); })));
-  const parts = byDay.map((set, i) => set.size ? `${DAYS[i]}: ${[...set].join(', ')}` : '').filter(Boolean);
-  return parts.length ? parts.join(' | ') : '';
+  const sc = normSched(u.schedule), whMap = {};
+  (S.config.warehouses || []).forEach(w => { whMap[w.id] = w; });
+  const line = days => DAYS.map((d, i) => { const l = (days[i + 1] || []).filter(id => whMap[id]).map(id => whMap[id].name); return l.length ? `${d}: ${l.join(', ')}` : ''; }).filter(Boolean).join(' | ');
+  if (sc.mode === 'recurring') { const l = line(sc.days); return l ? 'Every week: ' + l : ''; }
+  const now = FC.isoWeek(new Date()), next = shiftWeek(now, 1);
+  const cnt = wk => Object.values(sc.weeks[wk] || {}).reduce((n, l) => n + l.length, 0);
+  return `Week by week: this week ${cnt(now) ? cnt(now) + ' visit' + (cnt(now) === 1 ? '' : 's') : 'not planned'}, next week ${cnt(next) ? cnt(next) + ' visit' + (cnt(next) === 1 ? '' : 's') : 'not planned'}`;
 }
 function panelUsers() {
   const users = S.users, whs = S.config.warehouses || [];
@@ -812,39 +819,65 @@ function panelCleaning() {
   const byLoc = {};
   whs.forEach(w => { const l = w.location || 'No location'; (byLoc[l] = byLoc[l] || []).push(w); });
   const locs = Object.keys(byLoc).sort();
+  const thisWeek = FC.isoWeek(new Date());
+  S.schedWeek = S.schedWeek || {};
   let html = `<section class="panel"><span class="eyebrow dash">Cleaning</span><h2>Cleaner schedules</h2>
-    <p class="hint">Each schedule line is a set of days and the warehouses to clean on those days. A cleaner can have as many lines as needed, for example Mon and Wed at Al Quoz, Tue at Jebel Ali. Every scheduled warehouse becomes a work order on that day. Add cleaners in the Users tab with the role Cleaner.</p>`;
+    <p class="hint">Tick the warehouses each cleaner cleans on each day. <strong>Recurring</strong> repeats the same plan every week. <strong>Week by week</strong> is planned one week at a time and ends with that week, so plan the next week before Monday. Every ticked warehouse becomes a work order on that day. Add cleaners in the Users tab with the role Cleaner.</p>`;
   if (!S.users) html += '<p class="muted">Loading…</p>';
-  else if (!cleaners.length) html += `<div class="empty" style="margin:0"><h2>No cleaners yet</h2><p>Add a user with the role Cleaner, then set their schedule here.</p><button class="btn primary" data-setuptab="users">Go to Users</button></div>`;
+  else if (!cleaners.length) html += `<div class="empty" style="margin:0"><h2>No cleaners yet</h2><p>Add a user with the role Cleaner, then plan their schedule here.</p><button class="btn primary" data-setuptab="users">Go to Users</button></div>`;
   else if (!whs.length) html += '<p class="muted">Add warehouses first.</p>';
   else html += cleaners.map(u => {
-    const rows = u.schedule || [];
-    return `<div class="cl-card ${u.active ? '' : 'inactive'}" id="cleaner-${u.id}"><div class="row-main"><div class="grow"><div class="t">${esc(u.name)}${u.active ? '' : ' (inactive)'}</div><div class="m">${esc(scheduleSummary(u)) || '<span class="warn-t">No schedule yet</span>'}</div></div>
-      <button class="btn sm" data-addsched="${u.id}">+ Add schedule line</button></div>
-      ${rows.map((r, ri) => `<div class="sched">
-        <div class="sched-head"><span class="eyebrow">Line ${ri + 1}</span><button class="icon-btn ${S.armed === 'sc' + u.id + ':' + ri ? 'armed' : ''}" data-delsched="${u.id}" data-row="${ri}" aria-label="Remove schedule line" title="${S.armed === 'sc' + u.id + ':' + ri ? 'Click again to remove' : 'Remove line'}">×</button></div>
-        <div class="days" role="group" aria-label="Days">${DAYS.map((d, i) => `<button type="button" class="chip day" data-schedday="${u.id}" data-row="${ri}" data-day="${i + 1}" aria-pressed="${(r.days || []).includes(i + 1)}">${d}</button>`).join('')}</div>
-        <div class="sched-wh">${locs.map(l => `<div class="loc"><span class="loc-t">${esc(l)}</span>${byLoc[l].map(w => `<label><input type="checkbox" data-schedwh="${u.id}" data-row="${ri}" value="${esc(w.id)}" ${(r.warehouses || []).includes(w.id) ? 'checked' : ''}> ${esc(w.name)}</label>`).join('')}</div>`).join('')}</div>
-        ${!(r.days || []).length || !(r.warehouses || []).length ? `<p class="warn-t" style="font-size:.8125rem;margin:6px 0 0">Pick at least one day and one warehouse.</p>` : ''}
-      </div>`).join('')}
+    const sc = normSched(u.schedule), weekly = sc.mode === 'weekly';
+    const wk = S.schedWeek[u.id] || thisWeek;
+    const plan = weekly ? (sc.weeks[wk] || {}) : sc.days;
+    const has = (d, id) => (plan[d] || []).includes(id);
+    const dayCount = d => (plan[d] || []).filter(id => whs.some(w => w.id === id)).length;
+    const prevWk = shiftWeek(wk, -1), prevPlan = sc.weeks[prevWk] || {};
+    const prevHas = Object.values(prevPlan).some(l => l.length);
+    return `<div class="cl-card ${u.active ? '' : 'inactive'}" id="cleaner-${u.id}">
+      <div class="row-main"><div class="grow"><div class="t">${esc(u.name)}${u.active ? '' : ' (inactive)'}</div><div class="m">${esc(scheduleSummary(u)) || '<span class="warn-t">No schedule yet</span>'}</div></div>
+        <div class="seg" role="group" aria-label="Schedule type for ${esc(u.name)}">
+          <button type="button" class="seg-b mode ${!weekly ? 'on' : ''}" data-schedmode="${u.id}" data-mode="recurring" aria-pressed="${!weekly}">Recurring</button>
+          <button type="button" class="seg-b mode ${weekly ? 'on' : ''}" data-schedmode="${u.id}" data-mode="weekly" aria-pressed="${weekly}">Week by week</button></div></div>
+      ${weekly ? `<div class="wk-bar">
+          <button class="btn ghost sm" data-schedwk="${u.id}" data-dir="-1" ${wk <= thisWeek ? 'disabled' : ''} aria-label="Previous week">‹</button>
+          <div class="wk-label"><strong>Week ${weekNo(wk)}</strong> <span class="muted">${weekRangeText(wk)}</span>${wk === thisWeek ? ' <span class="pill prog">This week</span>' : wk === shiftWeek(thisWeek, 1) ? ' <span class="pill">Next week</span>' : ''}</div>
+          <button class="btn ghost sm" data-schedwk="${u.id}" data-dir="1" ${wk >= shiftWeek(thisWeek, 12) ? 'disabled' : ''} aria-label="Next week">›</button>
+          <span class="grow"></span>
+          ${prevHas ? `<button class="btn sm" data-schedcopy="${u.id}">Copy week ${weekNo(prevWk)}</button>` : ''}
+          ${Object.values(plan).some(l => l.length) ? `<button class="btn sm danger ${S.armed === 'clr' + u.id + wk ? 'armed' : ''}" data-schedclear="${u.id}">${S.armed === 'clr' + u.id + wk ? 'Confirm clear' : 'Clear week'}</button>` : ''}
+        </div>` : ''}
+      <div class="grid-wrap"><table class="sched-grid">
+        <thead><tr><th scope="col">Warehouse</th>${DAYS.map((d, i) => `<th scope="col">${d}${weekly ? `<span class="dnum">${dateOfWeekDay(wk, i + 1)}</span>` : ''}</th>`).join('')}</tr></thead>
+        <tbody>${locs.map(l => `<tr class="loc-row"><th colspan="8" scope="colgroup">${esc(l)}</th></tr>` + byLoc[l].map(w => `<tr><th scope="row">${esc(w.name)}</th>${DAYS.map((d, i) => `<td><label class="cell"><input type="checkbox" data-schedcell="${u.id}" data-day="${i + 1}" value="${esc(w.id)}" ${has(i + 1, w.id) ? 'checked' : ''} aria-label="${esc(w.name)} on ${DAYS_LONG[i]}"><span aria-hidden="true"></span></label></td>`).join('')}</tr>`).join('')).join('')}</tbody>
+        <tfoot><tr><th scope="row">Per day</th>${DAYS.map((d, i) => `<td>${dayCount(i + 1) || '<span class="muted">–</span>'}</td>`).join('')}</tr></tfoot>
+      </table></div>
+      ${weekly && !Object.values(plan).some(l => l.length) ? `<p class="warn-t" style="font-size:.8125rem;margin:8px 0 0">Week ${weekNo(wk)} isn’t planned yet: ${esc(u.name)} has no work orders that week.</p>` : ''}
     </div>`;
   }).join('');
   html += `</section>`;
   html += checklistEditor('clean');
   return html;
 }
+function dateOfWeekDay(wk, d) { const m = FC.weekStart(wk); m.setUTCDate(m.getUTCDate() + d - 1); return m.getUTCDate(); }
 function cleanersOf(whId) {
-  return (S.users || []).filter(u => u.role === 'cleaner' && u.active && (u.schedule || []).some(r => (r.warehouses || []).includes(whId) && (r.days || []).length)).map(u => u.name);
+  const thisWeek = FC.isoWeek(new Date());
+  return (S.users || []).filter(u => {
+    if (u.role !== 'cleaner' || !u.active) return false;
+    const sc = normSched(u.schedule), plan = sc.mode === 'weekly' ? (sc.weeks[thisWeek] || {}) : sc.days;
+    return Object.values(plan).some(l => (l || []).includes(whId));
+  }).map(u => u.name);
 }
 function editSchedule(uid_, fn) {
   const u = (S.users || []).find(x => x.id === +uid_); if (!u) return;
-  const sched = clone(u.schedule || []);
-  fn(sched);
-  u.schedule = sched;
+  const sc = clone(normSched(u.schedule));
+  fn(sc);
+  u.schedule = sc;
   renderSetup();
-  clearTimeout(S.schedT && S.schedT[uid_]); S.schedT = S.schedT || {};
-  S.schedT[uid_] = setTimeout(() => api('PUT', '/api/users/' + uid_, { schedule: u.schedule }).then(r => { u.schedule = r.user.schedule; setSave('saved'); }).catch(e => toast(e.message)), 500);
+  S.schedT = S.schedT || {};
+  clearTimeout(S.schedT[uid_]);
   setSave('saving');
+  S.schedT[uid_] = setTimeout(() => api('PUT', '/api/users/' + uid_, { schedule: u.schedule }).then(r => { u.schedule = r.user.schedule; setSave('saved'); }).catch(e => { setSave('error'); toast(e.message); }), 500);
 }
 
 /* ---------- Checklist import (Excel / CSV) ---------- */
@@ -1032,12 +1065,14 @@ main.addEventListener('click', e => {
     if (ds.focuscleaner) { const el = document.getElementById('cleaner-' + ds.focuscleaner); el && el.scrollIntoView({ block: 'start' }); }
     return;
   }
-  if (ds.addsched) return editSchedule(ds.addsched, sc => sc.push({ id: uid(), days: [], warehouses: [] }));
-  if (ds.delsched) {
-    if (S.armed !== 'sc' + ds.delsched + ':' + ds.row) { arm('sc' + ds.delsched + ':' + ds.row); renderSetup(); return; }
-    S.armed = null; return editSchedule(ds.delsched, sc => sc.splice(+ds.row, 1));
+  if (ds.schedmode) return editSchedule(ds.schedmode, sc => { sc.mode = ds.mode; });
+  if (ds.schedwk) { const cur = S.schedWeek[ds.schedwk] || FC.isoWeek(new Date()); S.schedWeek[ds.schedwk] = shiftWeek(cur, +ds.dir); S.armed = null; renderSetup(); const el = document.getElementById('cleaner-' + ds.schedwk); el && el.scrollIntoView({ block: 'nearest' }); return; }
+  if (ds.schedcopy) { const wk = S.schedWeek[ds.schedcopy] || FC.isoWeek(new Date()); return editSchedule(ds.schedcopy, sc => { sc.weeks[wk] = clone(sc.weeks[shiftWeek(wk, -1)] || {}); toast('Copied week ' + weekNo(shiftWeek(wk, -1))); }); }
+  if (ds.schedclear) {
+    const wk = S.schedWeek[ds.schedclear] || FC.isoWeek(new Date());
+    if (S.armed !== 'clr' + ds.schedclear + wk) { arm('clr' + ds.schedclear + wk); renderSetup(); return; }
+    S.armed = null; return editSchedule(ds.schedclear, sc => { delete sc.weeks[wk]; });
   }
-  if (ds.schedday) return editSchedule(ds.schedday, sc => { const r = sc[+ds.row]; const d = +ds.day; r.days = r.days.includes(d) ? r.days.filter(x => x !== d) : [...r.days, d].sort(); });
   if ('addwh' in ds) return addWarehouse();
   if (ds.editwh) { S.editWh = ds.editwh; renderSetup(); const f = main.querySelector('[data-ew="name"]'); f && f.focus(); return; }
   if (ds.savewh) {
@@ -1128,7 +1163,15 @@ main.addEventListener('change', e => {
     const ids = [...main.querySelectorAll(`input[data-uwh="${ds.uwh}"]:checked`)].map(x => x.value);
     return updateUser(ds.uwh, { warehouses: ids }, 'Warehouses updated');
   }
-  if (ds.schedwh) return editSchedule(ds.schedwh, sc => { const r = sc[+ds.row]; const set = new Set(r.warehouses); t.checked ? set.add(t.value) : set.delete(t.value); r.warehouses = [...set]; });
+  if (ds.schedcell) {
+    const id = ds.schedcell, d = +ds.day, on = t.checked, wh = t.value;
+    return editSchedule(id, sc => {
+      const wk = S.schedWeek[id] || FC.isoWeek(new Date());
+      const plan = sc.mode === 'weekly' ? (sc.weeks[wk] = sc.weeks[wk] || {}) : sc.days;
+      const set = new Set(plan[d] || []); on ? set.add(wh) : set.delete(wh);
+      if (set.size) plan[d] = [...set]; else delete plan[d];
+    });
+  }
   if (ds.uactive) return updateUser(ds.uactive, { active: t.checked }, t.checked ? 'User activated' : 'User deactivated and signed out');
 });
 main.addEventListener('keydown', e => {
