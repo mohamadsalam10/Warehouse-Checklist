@@ -5,7 +5,9 @@ const main = document.getElementById('main');
 const LABEL = { pass: 'Pass', fail: 'Fail', na: 'N/A' };
 const SEVS = ['minor', 'major', 'critical'];
 const clone = o => JSON.parse(JSON.stringify(o));
-const THIS_WEEK = isoWeek(new Date());
+// The current week comes from the server (Dubai time), so a phone set to another time zone still sees the right week.
+let THIS_WEEK = isoWeek(new Date());
+function setThisWeek(w) { if (!w || w === THIS_WEEK) return; if (S.week === THIS_WEEK) S.week = w; THIS_WEEK = w; }
 
 const S = {
   user: null, needsSetup: false, canEdit: false,
@@ -92,9 +94,9 @@ const supervisorsOf = whId => (S.users || []).filter(u => u.role === 'supervisor
 /* ---------- Tabs ---------- */
 const isCleanerUser = () => S.user && S.user.role === 'cleaner';
 function roleTabs() {
-  if (S.canEdit) return [['inspect', 'Inspect'], ['reports', 'Reports'], ['cleaning', 'Cleaning'], ['setup', 'Setup'], ['account', 'Account']];
+  if (S.canEdit) return [['inspect', 'Inspect'], ['fixes', 'Work orders'], ['reports', 'Reports'], ['cleaning', 'Cleaning'], ['setup', 'Setup'], ['account', 'Account']];
   if (isCleanerUser()) return [['today', 'Today'], ['schedule', 'My schedule']];
-  return [['inspect', 'Inspect']];
+  return [['inspect', 'Inspect'], ['fixes', 'Work orders']];
 }
 const homeTab = () => isCleanerUser() ? 'today' : 'inspect';
 function allowedTab(t) { return t === 'account' || roleTabs().some(x => x[0] === t); }
@@ -110,11 +112,13 @@ function goTab(t) {
   if (!allowedTab(t)) t = homeTab();
   if (S.draft) closeDraft();
   if (S.job) closeJob();
+  if (S.fix) closeFix();
   S.tab = t; S.armed = null; S.editWh = null;
   history.replaceState(null, '', t === homeTab() ? location.pathname : `#${t}${t === 'reports' && S.week !== THIS_WEEK ? '/' + S.week : ''}`);
   renderTabs(); render(); window.scrollTo(0, 0);
   if (t === 'setup' && S.canEdit) loadUsers();
   if (t === 'cleaning' && S.canEdit) loadRecords().then(() => { if (S.tab === 'cleaning') renderCleaning(); });
+  if (t === 'fixes') loadFixes().then(() => { if (S.tab === 'fixes' && !S.fix) renderFixes(); });
   if ((t === 'today' || t === 'schedule') && isCleanerUser()) loadCleaner().then(() => { if (S.tab === t && !S.job) render(); });
 }
 
@@ -152,6 +156,7 @@ async function doSetup() {
 }
 async function signedIn(user) {
   S.user = user; S.canEdit = user.role === 'admin';
+  try { const me = await api('GET', '/api/me'); setThisWeek(me.thisWeek); } catch (e) {}
   main.innerHTML = '<div class="loading">Loading…</div>';
   if (!allowedTab(S.tab)) S.tab = homeTab();
   if (user.role === 'cleaner') { renderTabs(); await loadCleaner(); render(); return; }
@@ -159,13 +164,14 @@ async function signedIn(user) {
   renderTabs();
   await loadWeek();
   if (S.tab === 'cleaning') await loadRecords();
+  if (S.tab === 'fixes') await loadFixes();
   if (S.canEdit) loadUsers();
   render();
 }
 async function signOut() {
   await flushAll();
   try { await api('POST', '/api/auth/logout'); } catch (e) {}
-  S.user = null; S.draft = null; S.job = null; S.cl = null; S.rec = null; S.config = null; S.tab = 'inspect';
+  S.user = null; S.draft = null; S.job = null; S.fix = null; S.fx = null; S.cl = null; S.rec = null; S.config = null; S.tab = 'inspect';
   history.replaceState(null, '', location.pathname);
   renderAuth();
 }
@@ -184,7 +190,7 @@ async function loadWeek() {
     r.inspections.forEach(i => { m[i.warehouseId] = i; });
     if (S.draft && S.draft.week === wk) m[S.draft.warehouseId] = clone(S.draft);
     Object.keys(writers).forEach(k => { if (pending(k) && k.startsWith('insp:' + wk + ':')) { const id = k.split(':')[2]; if (S.inspections[id]) m[id] = S.inspections[id]; } });
-    S.inspections = m; S.report = r.report; S.mailConfigured = r.mailConfigured; S.weekLoaded = true;
+    S.inspections = m; S.report = r.report; S.mailConfigured = r.mailConfigured; S.weekLoaded = true; S.fixed = r.fixed || []; S.openByWh = r.openByWh || {};
   } catch (e) { S.weekLoaded = true; if (e.status !== 401) toast(e.message); }
 }
 async function loadUsers() {
@@ -195,13 +201,14 @@ const setupFocused = () => main.contains(document.activeElement) && /INPUT|TEXTA
 /* ---------- Main render ---------- */
 function render() {
   if (!S.user) return renderAuth();
-  if (S.draft || S.job) return;
+  if (S.draft || S.job || S.fix) return;
   if (!allowedTab(S.tab)) S.tab = homeTab();
   if (S.tab === 'today') return renderToday();
   if (S.tab === 'schedule') return renderSchedule();
   if (S.tab === 'account') return renderAccount();
   if (!S.config) { main.innerHTML = '<div class="loading">Loading…</div>'; return; }
   if (S.tab === 'cleaning') return renderCleaning();
+  if (S.tab === 'fixes') return renderFixes();
   if (S.tab === 'setup' && S.canEdit) renderSetup();
   else if (S.tab === 'reports') renderReports();
   else if (S.tab === 'account') renderAccount();
@@ -250,7 +257,7 @@ function renderInspectHome() {
     if (!i) status = '<span class="pill">Not started</span>';
     else if (i.status === 'submitted') { cls = 'st-submitted'; status = `<span class="pill ok">Submitted</span><span class="score ${scoreClass(st.score)}">${st.score == null ? '–' : st.score + '%'}</span>`; }
     else { cls = 'st-draft'; status = `<span class="pill prog">In progress, ${st.answered} of ${st.total}</span>`; }
-    return `<li><button class="wh ${cls}" data-open="${esc(w.id)}"><span class="wh-name">${esc(w.name)}</span><span class="wh-meta">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${S.canEdit && S.users ? (() => { const sv = supervisorsOf(w.id); return sv.length ? ` | ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor assigned</span>'; })() : ''}</span><span class="wh-status">${status}</span></button></li>`;
+    return `<li><button class="wh ${cls}" data-open="${esc(w.id)}"><span class="wh-name">${esc(w.name)}</span><span class="wh-meta">${esc([w.code, w.location].filter(Boolean).join(', ')) || '&nbsp;'}${(S.openByWh || {})[w.id] ? ` | <span class="warn-t">${S.openByWh[w.id]} open work order${S.openByWh[w.id] === 1 ? '' : 's'}</span>` : ''}${S.canEdit && S.users ? (() => { const sv = supervisorsOf(w.id); return sv.length ? ` | ${esc(sv.map(u => u.name).join(', '))}` : ' | <span class="warn-t">No supervisor assigned</span>'; })() : ''}</span><span class="wh-status">${status}</span></button></li>`;
   }).join('') + '</ul>';
   main.innerHTML = html;
 }
@@ -402,6 +409,7 @@ async function submitDraft(btn) {
     S.draft = null; closeDraft();
     toast(r.weekComplete ? 'All warehouses are done. The report is being emailed to managers.' : `${d.warehouseName} submitted`);
     render(); window.scrollTo(0, 0);
+    loadWeek().then(() => { if (!S.draft && S.tab === 'inspect') render(); });
     if (r.weekComplete) setTimeout(() => loadWeek().then(() => { if (!S.draft) render(); }), 5000);
   } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = 'Submit inspection'; }
 }
@@ -602,6 +610,105 @@ function renderCleaning() {
   main.innerHTML = html;
 }
 
+/* ---------- Work orders from failed points (supervisors and admins) ---------- */
+async function loadFixes() {
+  const st = S.fxStatus || 'open';
+  try { const r = await api('GET', '/api/issues?status=' + st); S.fx = { status: st, list: r.issues }; } catch (e) { if (e.status !== 401) toast(e.message); }
+}
+const reportedText = f => `Reported week ${weekNo(f.firstWeek)}${f.lastWeek !== f.firstWeek ? `, last failed week ${weekNo(f.lastWeek)}` : ''}${f.timesReported > 1 ? ` (${f.timesReported} times)` : ''}`;
+function renderFixes() {
+  const st = S.fxStatus || 'open';
+  let html = `<span class="eyebrow dash">Work orders</span><h1 class="page-title" style="margin-bottom:8px">Fix failed points</h1>
+    <p class="hint">Every point marked Fail on an inspection becomes a work order here. If the same point fails again while its order is open, the existing order is updated, not duplicated. Add a note and “after” photos if you can, then mark it fixed.</p>
+    <div class="send-actions"><button class="btn sm ${st === 'open' ? 'primary' : ''}" data-fxstatus="open">Open</button><button class="btn sm ${st === 'fixed' ? 'primary' : ''}" data-fxstatus="fixed">Fixed (last 120 days)</button></div>`;
+  if (!S.fx || S.fx.status !== st) { main.innerHTML = html + '<div class="loading">Loading…</div>'; return; }
+  const list = S.fx.list;
+  if (!list.length) { main.innerHTML = html + `<div class="empty"><h2>${st === 'open' ? 'No open work orders' : 'Nothing fixed yet'}</h2><p>${st === 'open' ? 'Failed inspection points will appear here.' : 'Fixed work orders from the last 120 days appear here.'}</p></div>`; return; }
+  const byWh = {};
+  list.forEach(f => (byWh[f.warehouseName] = byWh[f.warehouseName] || []).push(f));
+  Object.keys(byWh).sort().forEach(wn => {
+    html += `<h3 class="rec-date">${esc(wn)} <span class="muted" style="font-weight:500;font-size:.875rem">${byWh[wn].length} ${st === 'open' ? 'open' : 'fixed'}</span></h3><ul class="wh-list">` +
+      byWh[wn].map(f => `<li><button class="wh fx-card ${f.status === 'fixed' ? 'st-submitted' : 'sev-' + f.severity}" data-openfx="${f.id}">
+        <span class="wh-name" style="font-size:1.05rem">${esc(f.pointText)}</span>
+        <span class="wh-meta">${esc([f.sectionTitle, f.group].filter(Boolean).join(' / '))} | ${f.status === 'fixed' ? `Fixed ${fmtDate(f.fixedAt)}${f.fixedByName ? ' by ' + esc(f.fixedByName) : ''}` : reportedText(f)}${f.status === 'open' && f.passedWeek ? ` | <span class="ok-t">Passed in week ${weekNo(f.passedWeek)}</span>` : ''}</span>
+        <span class="wh-status">${f.status === 'fixed' ? '<span class="pill ok">Fixed</span>' : `<span class="tag ${f.severity}">${cap(f.severity)}</span>`}${(f.beforePhotos.length + f.afterPhotos.length) ? `<span class="muted" style="font-size:.8125rem">${f.beforePhotos.length + f.afterPhotos.length} photo${f.beforePhotos.length + f.afterPhotos.length === 1 ? '' : 's'}</span>` : ''}</span></button></li>`).join('') + '</ul>';
+  });
+  main.innerHTML = html;
+}
+function openFix(id) { const f = S.fx.list.find(x => x.id === +id); if (!f) return; S.fix = clone(f); renderFix(); window.scrollTo(0, 0); }
+function closeFix() {
+  if (S.fix && S.fx) { const i = S.fx.list.findIndex(x => x.id === S.fix.id); if (i >= 0) S.fx.list[i] = clone(S.fix); }
+  S.fix = null; const bar = document.querySelector('.cl-bar'); bar && bar.remove();
+}
+function renderFix() {
+  const f = S.fix, ro = f.status === 'fixed';
+  const ph = (list, rm) => list.map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="Photo" loading="lazy" data-view="${esc(p)}">${rm && !ro ? `<button class="ph-x" data-rmfxphoto="${esc(p)}" aria-label="Remove photo">×</button>` : ''}</div>`).join('');
+  let html = `<div class="cl-head"><button class="btn ghost sm" data-backfx>‹ Work orders</button>
+    <div style="margin-top:20px"><span class="eyebrow">Work order | ${esc(f.warehouseName)}</span></div><h1>${esc(f.pointText)}</h1>
+    <div class="cl-sub">${esc([f.sectionTitle, f.group].filter(Boolean).join(' / '))}${f.category ? ' | ' + esc(f.category) : ''}</div></div>`;
+  if (ro) html += `<div class="banner"><div>Fixed ${fmtDateTime(f.fixedAt)}${f.fixedByName ? ' by ' + esc(f.fixedByName) : ''}.</div><button class="btn" data-reopenfx>Reopen</button></div>`;
+  if (!ro && f.passedWeek) html += `<div class="status-box ok"><strong>This point was marked Pass in the week ${weekNo(f.passedWeek)} inspection.</strong><p>If it’s resolved, mark the work order as fixed.</p></div>`;
+  html += `<section class="panel"><span class="eyebrow dash">Before</span><h2>What was found</h2>
+    <p class="hint" style="margin-bottom:8px"><span class="tag ${f.severity}">${cap(f.severity)}</span> ${reportedText(f)}.</p>
+    ${f.lastNote || f.firstNote ? `<p class="issue-note">${esc(f.lastNote || f.firstNote)}</p>` : ''}
+    ${f.firstNote && f.lastNote && f.firstNote !== f.lastNote ? `<p class="issue-note muted" style="font-size:.875rem">First reported: ${esc(f.firstNote)}</p>` : ''}
+    ${f.action ? `<p class="fix" style="margin-top:12px"><span class="fix-l">Corrective action</span>${esc(f.action)}</p>` : ''}
+    ${f.beforePhotos.length ? `<div class="photos" style="margin-top:12px">${ph(f.beforePhotos, false)}</div>` : '<p class="muted" style="font-size:.875rem;margin:12px 0 0">No photos from the inspection.</p>'}
+  </section>
+  <section class="panel"><span class="eyebrow dash">After</span><h2>${ro ? 'What was done' : 'Fix it'}</h2>
+    ${ro ? '' : '<p class="hint">Optional: describe what was done and add photos of how it looks now.</p>'}
+    ${ro && !f.fixNote ? '' : `<textarea data-fxnote rows="3" placeholder="What was done? (optional)" aria-label="What was done" ${ro ? 'readonly' : ''}>${esc(f.fixNote || '')}</textarea>`}
+    <div class="photos" style="margin-top:12px">${ph(f.afterPhotos, true)}${S.uploading.fx ? '<div class="ph up">Uploading…</div>' : ''}${ro || f.afterPhotos.length >= 12 ? '' : `<label class="ph add"><input class="vh" type="file" accept="image/*" multiple data-fxphoto aria-label="Add after photos"><span>+ Photo</span></label>`}</div>
+    ${ro && !f.afterPhotos.length ? '<p class="muted" style="font-size:.875rem;margin:8px 0 0">No after photos.</p>' : ''}
+  </section>`;
+  main.innerHTML = html;
+  let bar = document.querySelector('.cl-bar');
+  if (!bar) { bar = document.createElement('div'); bar.className = 'cl-bar'; document.body.appendChild(bar); }
+  bar.innerHTML = `<div class="cl-bar-in"><div class="bar-progress"><div class="bar-text">${esc(f.warehouseName)}: ${ro ? 'fixed' : 'open'}</div></div>${ro ? '<button class="btn primary" data-backfx>Done</button>' : '<button class="btn primary" data-dofix>Mark as fixed</button>'}</div>`;
+}
+function saveFix(d) {
+  const f = S.fix;
+  return queueSave('fx:' + f.id, () => api('PUT', '/api/issues/' + f.id, { fixNote: f.fixNote, afterPhotos: f.afterPhotos }), d);
+}
+async function addFixPhotos(files) {
+  const f = S.fix; if (!files.length) return;
+  S.uploading.fx = (S.uploading.fx || 0) + files.length; renderFix();
+  for (const file of files) {
+    try {
+      const blob = await compress(file);
+      if (!/^image\/(jpeg|png|webp)$/.test(blob.type)) throw new Error('Use a JPG, PNG or WebP photo.');
+      const r = await api('POST', '/api/photos', blob);
+      f.afterPhotos = (f.afterPhotos || []).concat(r.id);
+      if (S.fix === f) saveFix(400);
+    } catch (e) { toast('Photo didn’t upload. ' + e.message); }
+    S.uploading.fx--;
+  }
+  delete S.uploading.fx;
+  if (S.fix === f) renderFix();
+}
+async function doFix(btn) {
+  btn.disabled = true; btn.textContent = 'Saving…';
+  await flushAll();
+  try {
+    const r = await api('POST', `/api/issues/${S.fix.id}/fix`, { fixNote: S.fix.fixNote, afterPhotos: S.fix.afterPhotos });
+    if (S.fx) S.fx.list = S.fx.list.filter(x => x.id !== r.issue.id);
+    S.fix = null; closeFix(); toast('Marked as fixed'); renderFixes(); window.scrollTo(0, 0);
+  } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = 'Mark as fixed'; }
+}
+async function reopenFix() {
+  try { const r = await api('POST', `/api/issues/${S.fix.id}/reopen`); S.fix = r.issue; if (S.fx) S.fx.list = S.fx.list.filter(x => x.id !== r.issue.id); renderFix(); toast('Reopened'); }
+  catch (e) { toast(e.message); }
+}
+function fixedSectionHTML(whId) {
+  const list = (S.fixed || []).filter(f => f.warehouseId === whId), open = (S.openByWh || {})[whId] || 0;
+  return `<div class="fixed-box"><h4 style="margin-top:0">What was fixed this week (${list.length})</h4>
+    ${list.length ? '<ul class="issues">' + list.map(f => `<li class="fx-li"><div class="issue-top"><span class="pill ok">Fixed</span><strong>${esc(f.pointText)}</strong><span class="issue-sec">${esc([f.sectionTitle, f.group].filter(Boolean).join(' / '))} | ${reportedText(f)} | fixed ${fmtDate(f.fixedAt)}${f.fixedByName ? ' by ' + esc(f.fixedByName) : ''}</span></div>
+      ${f.fixNote ? `<p class="issue-note">${esc(f.fixNote)}</p>` : ''}
+      ${f.beforePhotos.length || f.afterPhotos.length ? `<div class="ba-grid"><div><span class="ba-l">Before</span><div class="photos">${f.beforePhotos.map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="Before" loading="lazy" data-view="${esc(p)}"></div>`).join('') || '<span class="muted" style="font-size:.8125rem">No photo</span>'}</div></div>
+        <div><span class="ba-l">After</span><div class="photos">${f.afterPhotos.map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="After" loading="lazy" data-view="${esc(p)}"></div>`).join('') || '<span class="muted" style="font-size:.8125rem">No photo</span>'}</div></div></div>` : ''}</li>`).join('') + '</ul>' : '<p class="muted" style="margin:0;font-size:.875rem">Nothing fixed this week.</p>'}
+    <p class="muted" style="margin:10px 0 0;font-size:.875rem">${open ? `${open} work order${open === 1 ? '' : 's'} still open for this warehouse.` : 'No open work orders for this warehouse.'}</p></div>`;
+}
+
 /* ---------- Reports ---------- */
 function emailStatusHTML(rows) {
   const r = S.report;
@@ -657,7 +764,11 @@ function renderReports() {
         ${x.it.action ? `<p class="issue-note muted" style="font-size:.875rem"><strong>Corrective action:</strong> ${esc(x.it.action)}</p>` : ''}
         ${x.a.photos && x.a.photos.length ? `<div class="photos" style="margin-top:8px">${x.a.photos.map(p => `<div class="ph"><img src="/api/photos/${esc(p)}" alt="Photo: ${esc(x.it.text)}" loading="lazy" data-view="${esc(p)}"></div>`).join('')}</div>` : ''}</li>`).join('') + '</ul>' : '<p class="ok-note">No issues found.</p>'}
       ${others.length ? `<h4>Other photos</h4><div class="gallery">${others.map(o => `<figure><img src="/api/photos/${esc(o.id)}" alt="Photo: ${esc(o.it.text)}" loading="lazy" data-view="${esc(o.id)}"><figcaption>${esc(o.it.text)}</figcaption></figure>`).join('')}</div>` : ''}
+      ${fixedSectionHTML(w.id)}
     </article>`;
+  });
+  rows.filter(r => !(r.i && r.i.status === 'submitted') && (S.fixed || []).some(f => f.warehouseId === r.w.id)).forEach(({ w }) => {
+    html += `<article class="rep-wh"><header><h3>${esc(w.name)}</h3></header><p class="rep-meta">Inspection not submitted this week.</p>${fixedSectionHTML(w.id)}</article>`;
   });
   main.innerHTML = html;
 }
@@ -1029,6 +1140,11 @@ main.addEventListener('click', e => {
   const t = e.target.closest('button, a, img[data-view]'); if (!t) return;
   const ds = t.dataset;
   if ('dologin' in ds) return doLogin();
+  if (ds.fxstatus) { S.fxStatus = ds.fxstatus; renderFixes(); loadFixes().then(() => { if (S.tab === 'fixes' && !S.fix) renderFixes(); }); return; }
+  if (ds.openfx) return openFix(ds.openfx);
+  if ('backfx' in ds) { flushAll(); closeFix(); renderFixes(); loadFixes().then(() => { if (S.tab === 'fixes' && !S.fix) renderFixes(); }); window.scrollTo(0, 0); return; }
+  if ('reopenfx' in ds) return reopenFix();
+  if (ds.rmfxphoto && S.fix) { S.fix.afterPhotos = S.fix.afterPhotos.filter(p => p !== ds.rmfxphoto); saveFix(); renderFix(); return; }
   if (ds.tabGo) return goTab(ds.tabGo);
   if (ds.openjob) return openJob(ds.openjob);
   if ('backjob' in ds) { flushAll(); closeJob(); render(); window.scrollTo(0, 0); return; }
@@ -1129,12 +1245,15 @@ document.body.addEventListener('click', e => {
   const t = e.target.closest('.cl-bar button'); if (!t) return;
   if ('submit' in t.dataset) submitDraft(t);
   if ('completejob' in t.dataset) completeJob(t);
+  if ('dofix' in t.dataset) doFix(t);
+  if ('backfx' in t.dataset) { flushAll(); closeFix(); renderFixes(); window.scrollTo(0, 0); }
   if ('backjob' in t.dataset) { flushAll(); closeJob(); render(); window.scrollTo(0, 0); }
   if ('back' in t.dataset) { closeDraft(); render(); window.scrollTo(0, 0); }
 });
 main.addEventListener('input', e => {
   const t = e.target, ds = t.dataset;
   if ('jobnote' in ds && S.job) { S.job.note = t.value; saveJob(1200); return; }
+  if ('fxnote' in ds && S.fix) { S.fix.fixNote = t.value; saveFix(1200); return; }
   if ('note' in ds && S.draft) {
     const id = t.closest('[data-item]').dataset.item;
     const a = S.draft.answers[id] || (S.draft.answers[id] = {});
@@ -1148,6 +1267,7 @@ main.addEventListener('change', e => {
   const t = e.target, ds = t.dataset;
   if ('photo' in ds) { const id = t.closest('[data-item]').dataset.item; addPhotos(id, [...t.files]); t.value = ''; return; }
   if ('jobphoto' in ds) { addJobPhotos([...t.files]); t.value = ''; return; }
+  if ('fxphoto' in ds) { addFixPhotos([...t.files]); t.value = ''; return; }
   if (ds.tick && S.job) { if (t.checked) S.job.checks[ds.tick] = true; else delete S.job.checks[ds.tick]; t.closest('.tick').classList.toggle('on', t.checked); saveJob(800); updateJobProgress(); return; }
   if (ds.recf) {
     S.recF[ds.recf] = t.value;
@@ -1201,11 +1321,11 @@ window.addEventListener('beforeunload', e => { if (Object.keys(writers).some(pen
 
 /* ---------- Boot ---------- */
 (async function boot() {
-  const m = location.hash.match(/^#(reports|setup|account|cleaning|today|schedule)(?:\/(\d{4}-W\d{2}))?/);
+  const m = location.hash.match(/^#(reports|setup|account|cleaning|today|schedule|fixes)(?:\/(\d{4}-W\d{2}))?/);
   if (m) { S.tab = m[1]; if (m[2] && m[2] <= THIS_WEEK) S.week = m[2]; }
   try {
     const r = await api('GET', '/api/me');
-    S.needsSetup = r.needsSetup;
+    S.needsSetup = r.needsSetup; setThisWeek(r.thisWeek);
     if (!r.user) return renderAuth();
     await signedIn(r.user);
     if (S.tab === 'setup' && S.canEdit) loadUsers();

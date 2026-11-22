@@ -90,7 +90,7 @@ function rateLimit(key) {
 
 app.get('/api/me', wrap(async (req, res) => {
   const n = await q('SELECT count(*)::int AS n FROM users');
-  res.json({ user: req.user ? publicUser(req.user) : null, needsSetup: n.rows[0].n === 0 });
+  res.json({ user: req.user ? publicUser(req.user) : null, needsSetup: n.rows[0].n === 0, thisWeek: isoWeekOf(localDate()), today: localDate() });
 }));
 
 app.post('/api/auth/setup', wrap(async (req, res) => {
@@ -278,13 +278,15 @@ app.get('/api/weeks/:week', auth, wrap(async (req, res) => {
   const [all, rep] = await Promise.all([weekInspections(req.params.week), q('SELECT * FROM reports WHERE week = $1', [req.params.week])]);
   const admin = req.user.role === 'admin';
   const inspections = admin ? all : all.filter(i => canInspect(req.user, i.warehouseId));
-  res.json({ inspections, report: admin ? rowToReport(rep.rows[0]) : null, mailConfigured: !!provider() });
+  const oc = await q(`SELECT warehouse_id, count(*)::int AS n FROM issues WHERE status = 'open' GROUP BY warehouse_id`);
+  const openByWh = {}; oc.rows.forEach(x => { if (canInspect(req.user, x.warehouse_id)) openByWh[x.warehouse_id] = x.n; });
+  res.json({ inspections, report: admin ? rowToReport(rep.rows[0]) : null, mailConfigured: !!provider(), openByWh, fixed: admin ? await fixedInWeek(req.params.week) : [] });
 }));
 
 async function upsertDraft(req) {
   const { week, wh } = req.params;
   checkWeek(week);
-  if (week > FC.isoWeek(new Date())) fail(400, 'You can’t inspect a future week.');
+  if (week > isoWeekOf(localDate())) fail(400, 'You can’t inspect a future week.');
   if (!canInspect(req.user, wh)) fail(403, 'This warehouse isn’t assigned to you. Ask an admin.');
   const answers = cleanAnswers(req.body.answers);
   const ex = await q('SELECT * FROM inspections WHERE week = $1 AND warehouse_id = $2', [week, wh]);
@@ -317,6 +319,7 @@ app.post('/api/inspections/:week/:wh/submit', auth, wrap(async (req, res) => {
   if (left) fail(400, `${left} point${left === 1 ? '' : 's'} still ${left === 1 ? 'needs' : 'need'} checking.`);
   if (st.noteMissing) fail(400, `${st.noteMissing} failed point${st.noteMissing === 1 ? ' needs' : 's need'} a note.`);
   const r = await q(`UPDATE inspections SET status = 'submitted', submitted_by = $1, submitted_at = now(), updated_at = now() WHERE id = $2 RETURNING *`, [req.user.id, row.id]);
+  await syncIssues(r.rows[0]);
   const week = req.params.week;
   const done = await weekComplete(week);
   res.json({ inspection: rowToInsp(Object.assign(r.rows[0], { submitted_by_name: req.user.name })), weekComplete: done });
@@ -364,8 +367,9 @@ async function weekComplete(week) {
   const done = new Set(r.rows.map(x => x.warehouse_id));
   return active.every(w => done.has(w.id));
 }
-async function photoDataFor(rows) {
+async function photoDataFor(rows, fixed) {
   const ids = [];
+  (fixed || []).forEach(f => ids.push(...f.beforePhotos, ...f.afterPhotos));
   rows.forEach(({ i }) => { if (i && i.status === 'submitted') i.sections.forEach(sec => sec.items.forEach(it => { const a = i.answers[it.id]; if (a && a.photos) ids.push(...a.photos); })); });
   if (!ids.length) return { map: {}, bytes: 0 };
   const r = await q('SELECT id, mime, data FROM photos WHERE id = ANY($1)', [ids]);
@@ -392,16 +396,18 @@ async function sendWeek(week, { trigger }) {
   try {
     const [cfg, sender, inspections] = await Promise.all([getConfig(), getSender(), weekInspections(week)]);
     const rows = FC.weekRows(cfg, inspections);
+    const fixed = await fixedInWeek(week), openByWh = await openCounts();
     if (!cfg.managers.length) throw new Error('No managers are set up. Add them in Setup.');
     if (!provider()) throw new Error('No email provider is configured on the server. Set RESEND_API_KEY or SMTP_HOST.');
     if (!sender.email) throw new Error('No sender email is set. Add one in Setup.');
     for (const m of cfg.managers) {
       const mine = FC.managerRows(m, rows);
       if (!mine.length) { recipients.push({ name: m.name, email: m.email, ok: false, error: 'No warehouses assigned' }); continue; }
-      const { map, bytes } = await photoDataFor(mine);
+      const myIds = new Set(mine.map(x => x.w.id)), myFixed = fixed.filter(f => myIds.has(f.warehouseId));
+      const { map, bytes } = await photoDataFor(mine, myFixed);
       const attach = bytes <= MAX_ATTACH_BYTES;
-      const mail = buildEmail({ week, rows, manager: m, appUrl: APP_URL, photoUrl, attachmentNote: attach });
-      const attachments = attach ? [{ filename: `Facility-inspection-${week}.html`, content: Buffer.from(buildReportFile({ week, rows: mine, photoData: map })), contentType: 'text/html' }] : [];
+      const mail = buildEmail({ week, rows, manager: m, appUrl: APP_URL, photoUrl, attachmentNote: attach, fixed: myFixed, openByWh });
+      const attachments = attach ? [{ filename: `Facility-inspection-${week}.html`, content: Buffer.from(buildReportFile({ week, rows: mine, photoData: map, fixed: myFixed, openByWh })), contentType: 'text/html' }] : [];
       try {
         await sendMail({ fromName: sender.name, fromEmail: sender.email, replyTo: sender.replyTo, to: m.email, subject: mail.subject, html: mail.html, text: mail.text, attachments });
         recipients.push({ name: m.name, email: m.email, ok: true });
@@ -433,9 +439,10 @@ app.get('/api/reports/:week/download', admin, wrap(async (req, res) => {
   checkWeek(req.params.week);
   const week = req.params.week;
   const rows = FC.weekRows(await getConfig(), await weekInspections(week));
-  const { map } = await photoDataFor(rows);
+  const fixed = await fixedInWeek(week);
+  const { map } = await photoDataFor(rows, fixed);
   res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Content-Disposition': `attachment; filename="Facility-inspection-${week}.html"` });
-  res.send(buildReportFile({ week, rows, photoData: map }));
+  res.send(buildReportFile({ week, rows, photoData: map, fixed, openByWh: await openCounts() }));
 }));
 
 
@@ -591,6 +598,99 @@ app.get('/api/cleaning/records', admin, wrap(async (req, res) => {
   const r = await q(`SELECT j.*, u.name AS cleaner_name FROM cleaning_jobs j JOIN users u ON u.id = j.cleaner_id
                      WHERE job_date BETWEEN $1 AND $2 ORDER BY job_date DESC, u.name, warehouse_location, warehouse_name`, [from, to]);
   res.json({ today, from, to, jobs: r.rows.map(rowToJob) });
+}));
+
+
+/* ---------- Work orders from failed inspection points ---------- */
+const rowToIssue = r => ({
+  id: r.id, warehouseId: r.warehouse_id, warehouseName: r.warehouse_name, pointId: r.point_id, pointText: r.point_text,
+  sectionTitle: r.section_title, group: r.point_group, category: r.category, action: r.action, severity: r.severity,
+  firstWeek: r.first_week, lastWeek: r.last_week, timesReported: r.times_reported, passedWeek: r.passed_week,
+  firstNote: r.first_note, lastNote: r.last_note, beforePhotos: r.before_photos || [], status: r.status,
+  fixNote: r.fix_note, afterPhotos: r.after_photos || [], fixedBy: r.fixed_by, fixedByName: r.fixed_by_name || '',
+  fixedAt: r.fixed_at ? +r.fixed_at : null, createdAt: +r.created_at, updatedAt: +r.updated_at
+});
+const ISSUE_SELECT = `SELECT i.*, u.name AS fixed_by_name FROM issues i LEFT JOIN users u ON u.id = i.fixed_by`;
+
+/*
+ * Called when an inspection is submitted. Each failed point either updates the warehouse's open
+ * work order for that point (matched by point id, or by the same wording if the checklist was re-imported)
+ * or opens a new one. Nothing is duplicated, and resubmitting the same week is safe.
+ */
+async function syncIssues(row) {
+  const week = row.week, wh = row.warehouse_id, answers = row.answers || {};
+  const open = (await q(`SELECT * FROM issues WHERE warehouse_id = $1 AND status = 'open'`, [wh])).rows;
+  const match = it => open.find(o => o.point_id === it.id || o.point_text.trim().toLowerCase() === String(it.text).trim().toLowerCase());
+  const touched = new Set();
+  for (const sec of row.sections || []) for (const it of sec.items) {
+    const a = answers[it.id] || {};
+    const o = match(it);
+    if (a.s === 'fail') {
+      const photos = (a.photos || []).filter(p => /^[a-f0-9]{32}$/.test(p));
+      if (o) {
+        touched.add(o.id);
+        const merged = [...new Set([...(o.before_photos || []), ...photos])].slice(0, 20);
+        await q(`UPDATE issues SET severity = $2, last_note = $3, before_photos = $4, passed_week = NULL, updated_at = now(),
+                 times_reported = times_reported + CASE WHEN last_week = $5 THEN 0 ELSE 1 END, last_week = $5 WHERE id = $1`,
+          [o.id, a.sev || 'major', a.note || '', JSON.stringify(merged), week]);
+      } else {
+        const r = await q(`INSERT INTO issues (warehouse_id, warehouse_name, point_id, point_text, section_title, point_group, category, action, severity,
+                 first_week, last_week, first_note, last_note, before_photos) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$11,$12) RETURNING *`,
+          [wh, row.warehouse_name, it.id, it.text, sec.title, it.group || '', it.category || '', it.action || '', a.sev || 'major', week, a.note || '', JSON.stringify(photos)]);
+        touched.add(r.rows[0].id); open.push(r.rows[0]);
+      }
+    } else if (a.s === 'pass' && o && !touched.has(o.id)) {
+      await q(`UPDATE issues SET passed_week = $2 WHERE id = $1`, [o.id, week]);
+    }
+  }
+  // An order opened by this week's inspection, untouched, whose point no longer fails (changed on resubmit) is removed.
+  await q(`DELETE FROM issues WHERE warehouse_id = $1 AND status = 'open' AND first_week = $2 AND last_week = $2
+           AND fix_note = '' AND after_photos = '[]'::jsonb AND NOT (id = ANY($3::int[]))`, [wh, week, [...touched]]);
+}
+async function openCounts() {
+  const r = await q(`SELECT warehouse_id, count(*)::int AS n FROM issues WHERE status = 'open' GROUP BY warehouse_id`);
+  const out = {}; r.rows.forEach(x => { out[x.warehouse_id] = x.n; }); return out;
+}
+/* Work orders fixed during an ISO week (Monday to Sunday, local time). */
+async function fixedInWeek(week) {
+  const start = FC.weekStart(week).toISOString().slice(0, 10), end = addDays(start, 6);
+  const r = await q(`${ISSUE_SELECT} WHERE i.status = 'fixed' AND (i.fixed_at AT TIME ZONE $3)::date BETWEEN $1 AND $2 ORDER BY i.warehouse_name, i.fixed_at`, [start, end, TZ]);
+  return r.rows.map(rowToIssue);
+}
+async function ownIssue(req) {
+  const r = await q(`${ISSUE_SELECT} WHERE i.id = $1`, [Number(req.params.id)]);
+  if (!r.rowCount) fail(404, 'Work order not found.');
+  if (!canInspect(req.user, r.rows[0].warehouse_id)) fail(403, 'This warehouse isn’t assigned to you.');
+  return r.rows[0];
+}
+const notCleaner = (req, res, next) => req.user && req.user.role !== 'cleaner' ? next() : next(new HttpError(403, 'Not available for cleaners.'));
+
+app.get('/api/issues', auth, notCleaner, wrap(async (req, res) => {
+  const status = req.query.status === 'fixed' ? 'fixed' : 'open';
+  const r = status === 'open'
+    ? await q(`${ISSUE_SELECT} WHERE i.status = 'open' ORDER BY CASE i.severity WHEN 'critical' THEN 0 WHEN 'major' THEN 1 ELSE 2 END, i.first_week, i.warehouse_name`)
+    : await q(`${ISSUE_SELECT} WHERE i.status = 'fixed' AND i.fixed_at > now() - interval '120 days' ORDER BY i.fixed_at DESC`);
+  res.json({ issues: r.rows.filter(x => canInspect(req.user, x.warehouse_id)).map(rowToIssue) });
+}));
+async function saveIssue(req, fix) {
+  const o = await ownIssue(req);
+  if (o.status === 'fixed') fail(409, 'This work order is already fixed. Reopen it to make changes.');
+  const note = str(req.body.fixNote, 1000);
+  const photos = (Array.isArray(req.body.afterPhotos) ? req.body.afterPhotos : []).filter(p => /^[a-f0-9]{32}$/.test(p)).slice(0, 12);
+  const r = await q(`UPDATE issues SET fix_note = $2, after_photos = $3, status = $4, fixed_by = $5, fixed_at = $6, updated_at = now() WHERE id = $1 RETURNING *`,
+    [o.id, note, JSON.stringify(photos), fix ? 'fixed' : 'open', fix ? req.user.id : null, fix ? new Date() : null]);
+  return rowToIssue(Object.assign(r.rows[0], { fixed_by_name: fix ? req.user.name : '' }));
+}
+app.put('/api/issues/:id', auth, notCleaner, wrap(async (req, res) => res.json({ issue: await saveIssue(req, false) })));
+app.post('/api/issues/:id/fix', auth, notCleaner, wrap(async (req, res) => res.json({ issue: await saveIssue(req, true) })));
+app.post('/api/issues/:id/reopen', auth, notCleaner, wrap(async (req, res) => {
+  const o = await ownIssue(req);
+  if (o.status !== 'fixed') return res.json({ issue: rowToIssue(o) });
+  // Only one open order per point: if the point failed again after the fix, that newer order stays the open one.
+  const dup = await q(`SELECT id FROM issues WHERE warehouse_id = $1 AND status = 'open' AND (point_id = $2 OR lower(point_text) = lower($3))`, [o.warehouse_id, o.point_id, o.point_text]);
+  if (dup.rowCount) fail(409, 'A newer open work order already exists for this point.');
+  const r = await q(`UPDATE issues SET status = 'open', fixed_by = NULL, fixed_at = NULL, updated_at = now() WHERE id = $1 RETURNING *`, [o.id]);
+  res.json({ issue: rowToIssue(r.rows[0]) });
 }));
 
 /* ---------- Static app ---------- */

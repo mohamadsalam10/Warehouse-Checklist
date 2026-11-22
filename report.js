@@ -10,7 +10,27 @@ const sevStyle = { critical: 'background:#FE5000;color:#FFFFFF', major: 'backgro
 const subjectFor = week => `Weekly facility inspection: week ${weekNo(week)} (${weekRangeText(week)})`;
 
 /* ---------- Email to one manager (Arial, table layout, inline styles for email clients) ---------- */
-function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
+/* "What was fixed" block for one warehouse (email: Arial, inline styles, images by signed link) */
+function fixedEmailHTML(list, photoUrl, open) {
+  const F = 'font-family:Arial,Helvetica,sans-serif;';
+  const img = p => `<a href="${photoUrl(p)}"><img src="${photoUrl(p)}" width="100" height="100" alt="Photo" style="width:100px;height:100px;object-fit:cover;border:1px solid #E6E6E6;margin:0 6px 6px 0"></a>`;
+  const lab = t => `<div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:#6B6B6B;margin-bottom:4px">${t}</div>`;
+  let h = `<div style="${F}margin:14px 0 6px;padding:12px 14px;background:#F5F5F3;border-left:3px solid #0A0A0A">
+    <div style="font-size:10px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;color:#FE5000">What was fixed this week (${list.length})</div>`;
+  if (!list.length) h += `<p style="margin:6px 0 0;color:#6B6B6B;font-size:13px">Nothing fixed this week.</p>`;
+  list.forEach(f => {
+    h += `<div style="border-top:1px solid #E6E6E6;margin-top:8px;padding-top:8px;font-size:13px"><b>${esc(f.pointText)}</b>
+      <div style="color:#6B6B6B;font-size:12px">${esc([f.sectionTitle, f.group].filter(Boolean).join(' / '))} | reported week ${weekNo(f.firstWeek)}${f.timesReported > 1 ? ` (${f.timesReported} times)` : ''} | fixed ${fmtDate(f.fixedAt)}${f.fixedByName ? ' by ' + esc(f.fixedByName) : ''}</div>
+      ${f.fixNote ? `<div style="margin-top:4px;color:#2B2B2B">${esc(f.fixNote)}</div>` : ''}
+      ${f.beforePhotos.length || f.afterPhotos.length ? `<table role="presentation" cellspacing="0" cellpadding="0" style="margin-top:6px"><tr>
+        <td style="vertical-align:top;padding-right:16px">${lab('BEFORE')}${f.beforePhotos.slice(0, 3).map(img).join('') || '<span style="color:#9A9A9A;font-size:12px">No photo</span>'}</td>
+        <td style="vertical-align:top">${lab('AFTER')}${f.afterPhotos.slice(0, 3).map(img).join('') || '<span style="color:#9A9A9A;font-size:12px">No photo</span>'}</td></tr></table>` : ''}
+    </div>`;
+  });
+  h += `<p style="margin:8px 0 0;font-size:12px;color:#6B6B6B">${open ? `${open} work order${open === 1 ? '' : 's'} still open for this warehouse.` : 'No open work orders for this warehouse.'}</p></div>`;
+  return h;
+}
+function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote, fixed, openByWh }) {
   const mine = managerRows(manager, rows);
   const sub = mine.filter(r => r.i && r.i.status === 'submitted');
   const totIssues = sub.reduce((n, r) => n + stats(r.i).fail, 0);
@@ -34,7 +54,12 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
     }).join('')}
   </table>`;
 
-  sub.forEach(({ w, i }) => {
+  mine.forEach(({ w, i }) => {
+    const myFix = (fixed || []).filter(f => f.warehouseId === w.id), open = (openByWh || {})[w.id] || 0;
+    if (!i || i.status !== 'submitted') {
+      if (myFix.length) html += `<h2 style="${F}font-size:17px;margin:22px 0 4px">${esc(w.name)}</h2><p style="margin:0 0 6px;color:#6B6B6B;font-size:12px">Inspection not submitted this week.</p>` + fixedEmailHTML(myFix, photoUrl, open);
+      return;
+    }
     const st = stats(i), iss = issuesOf(i);
     html += `<h2 style="${F}font-size:17px;margin:22px 0 4px">${esc(w.name)}: ${scoreTxt(st.score)}</h2>
     <p style="margin:0 0 10px;color:#6B6B6B;font-size:12px">Inspected by ${esc(i.submittedByName || 'a supervisor')} on ${fmtDate(i.submittedAt)}. ${st.pass} passed, ${st.fail} failed, ${st.na} not applicable.</p>`;
@@ -48,6 +73,7 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
         ${(x.a.photos || []).length ? `<div style="margin-top:6px">${x.a.photos.map(p => `<a href="${photoUrl(p)}"><img src="${photoUrl(p)}" width="120" height="120" alt="Photo: ${esc(x.it.text)}" style="width:120px;height:120px;object-fit:cover;border:1px solid #E6E6E6;margin:0 6px 6px 0"></a>`).join('')}</div>` : ''}
       </div>`;
     });
+    html += fixedEmailHTML(myFix, photoUrl, open);
   });
 
   html += `<p style="margin:24px 0 0">${attachmentNote ? 'The full report with all photos is attached.' : 'Photos above link to full size.'}${appUrl ? ` You can also <a href="${esc(appUrl)}/#reports/${week}" style="color:#004FE5">open the report in Facility Check</a>.` : ''}</p>
@@ -63,6 +89,9 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
     const st = stats(i);
     lines.push(`${w.name}: score ${scoreTxt(st.score)}, ${pl(st.fail, 'issue')}${st.critical ? ` (${st.critical} critical)` : ''}`);
     issuesOf(i).forEach(x => { lines.push(`  - [${cap(x.a.sev || 'major')}] ${x.sec.title}${x.it.group ? ' / ' + x.it.group : ''}: ${x.it.text}${x.a.note ? ': ' + x.a.note : ''}`); if (x.it.action) lines.push(`    Corrective action: ${x.it.action}`); });
+    const myFix = (fixed || []).filter(f => f.warehouseId === w.id);
+    lines.push(`  What was fixed this week: ${myFix.length ? '' : 'nothing'}`);
+    myFix.forEach(f => lines.push(`    + ${f.pointText} (fixed ${fmtDate(f.fixedAt)}${f.fixedByName ? ' by ' + f.fixedByName : ''})${f.fixNote ? ': ' + f.fixNote : ''}`));
     lines.push('');
   });
   lines.push(attachmentNote ? 'The full report with all photos is attached.' : '', appUrl ? `Open the report: ${appUrl}/#reports/${week}` : '', '', 'Thanks,', 'Facility Check');
@@ -71,7 +100,7 @@ function buildEmail({ week, rows, manager, appUrl, photoUrl, attachmentNote }) {
 }
 
 /* ---------- Downloadable / attached report (storage.ae internal report chrome) ---------- */
-function buildReportFile({ week, rows, photoData }) {
+function buildReportFile({ week, rows, photoData, fixed, openByWh }) {
   const img = (id, alt) => photoData[id] ? `<img src="${photoData[id]}" alt="${esc(alt)}" class="ph">` : '';
   const sub = rows.filter(r => r.i && r.i.status === 'submitted');
   const all = sub.map(r => stats(r.i));
@@ -97,7 +126,19 @@ function buildReportFile({ week, rows, photoData }) {
       const st = stats(i);
       return `<tr><td><b>${esc(w.name)}</b></td><td class="r"><b style="color:${scoreCol(st.score)}">${scoreTxt(st.score)}</b></td><td class="r">${st.pass}</td><td class="r">${st.fail}</td><td class="r">${st.critical}</td><td>${esc(i.submittedByName || '')}, ${fmtDate(i.submittedAt)}</td></tr>`;
     }).join('') + '</table>';
-  sub.forEach(({ w, i }, n) => {
+  const fixedBlock = (list, open) => `<div class="fixed"><span class="lab">What was fixed this week (${list.length})</span>
+      ${list.length ? list.map(f => `<div class="fx"><b>${esc(f.pointText)}</b> <span class="m sm">${esc([f.sectionTitle, f.group].filter(Boolean).join(' / '))} | reported week ${weekNo(f.firstWeek)}${f.timesReported > 1 ? ` (${f.timesReported} times)` : ''} | fixed ${fmtDate(f.fixedAt)}${f.fixedByName ? ' by ' + esc(f.fixedByName) : ''}</span>
+        ${f.fixNote ? `<div class="nt">${esc(f.fixNote)}</div>` : ''}
+        ${f.beforePhotos.length || f.afterPhotos.length ? `<div class="ba"><div><span class="bal">Before</span>${f.beforePhotos.map(p => img(p, 'Before: ' + f.pointText)).join('') || '<span class="m sm">No photo</span>'}</div><div><span class="bal">After</span>${f.afterPhotos.map(p => img(p, 'After: ' + f.pointText)).join('') || '<span class="m sm">No photo</span>'}</div></div>` : ''}</div>`).join('') : '<p class="m sm" style="margin:6px 0 0">Nothing fixed this week.</p>'}
+      <p class="m sm" style="margin:8px 0 0">${open ? `${open} work order${open === 1 ? '' : 's'} still open for this warehouse.` : 'No open work orders for this warehouse.'}</p></div>`;
+  let secN = 1;
+  rows.forEach(({ w, i }) => {
+    const myFix = (fixed || []).filter(f => f.warehouseId === w.id), open = (openByWh || {})[w.id] || 0;
+    if (!i || i.status !== 'submitted') {
+      if (myFix.length) body += `<div class="wh"><div class="sh"><span class="lab">Section ${String(++secN).padStart(2, '0')}</span><h2>${esc(w.name)}</h2></div><p class="m">Inspection not submitted this week.</p>${fixedBlock(myFix, open)}</div>`;
+      return;
+    }
+    const n = (++secN) - 2;
     const st = stats(i), iss = issuesOf(i), others = otherPhotos(i);
     body += `<div class="wh"><div class="sh"><span class="lab">Section ${String(n + 2).padStart(2, '0')}</span><h2>${esc(w.name)} <span style="float:right;color:${scoreCol(st.score)}">${scoreTxt(st.score)}</span></h2></div>
       <p class="m">${st.pass} passed, ${st.fail} failed, ${st.na} not applicable. Inspected by ${esc(i.submittedByName || '')} on ${fmtDate(i.submittedAt)}.</p>
@@ -105,6 +146,7 @@ function buildReportFile({ week, rows, photoData }) {
       <h3>Issues found (${iss.length})</h3>
       ${iss.length ? iss.map(x => `<div class="iss"><span class="tag" style="${sevStyle[x.a.sev || 'major']}">${cap(x.a.sev || 'major')}</span> <b>${esc(x.it.text)}</b> <span class="m sm">${esc([x.sec.title, x.it.group].filter(Boolean).join(' / '))}${x.it.category ? ' | ' + esc(x.it.category) : ''}</span>${x.a.note ? `<div class="nt">${esc(x.a.note)}</div>` : ''}${x.it.action ? `<div class="m sm" style="margin-top:3px"><b>Corrective action:</b> ${esc(x.it.action)}</div>` : ''}<div>${(x.a.photos || []).map(p => img(p, x.it.text)).join('')}</div></div>`).join('') : '<p><b>No issues found.</b></p>'}
       ${others.length ? `<h3>Other photos</h3><div>${others.map(o => `<figure>${img(o.id, o.it.text)}<figcaption>${esc(o.it.text)}</figcaption></figure>`).join('')}</div>` : ''}
+      ${fixedBlock(myFix, open)}
     </div>`;
   });
   body += `</div><div class="foot"><span>storage.ae | Operations</span><span>Internal use only</span><span>Formerly 800 Storage</span></div>`;
@@ -123,6 +165,8 @@ function buildReportFile({ week, rows, photoData }) {
   h3{font-size:16px;margin:20px 0 8px}.iss{border-top:1px solid #E6E6E6;padding:10px 0}.tag{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:4px}
   .nt{margin-top:4px;color:#2B2B2B}.ph{width:160px;height:160px;object-fit:cover;border-radius:6px;margin:8px 8px 0 0;border:1px solid #E6E6E6}
   figure{display:inline-block;margin:0 8px 8px 0;vertical-align:top;width:160px}figure .ph{margin:0}figcaption{font-size:11px;color:#6B6B6B}
+  .fixed{margin:18px 0 0;padding:14px 16px;background:#F5F5F3;border-left:3px solid #0A0A0A}.fx{border-top:1px solid #E6E6E6;margin-top:10px;padding-top:10px;font-size:13px}
+  .ba{display:flex;gap:24px;flex-wrap:wrap;margin-top:6px}.bal{display:block;font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#6B6B6B;margin-top:6px}.ba .ph{width:130px;height:130px}
   .foot{max-width:860px;margin:0 auto;padding:12px 40px 32px;border-top:1px solid #E6E6E6;display:flex;justify-content:space-between;font-size:10px;color:#767676;gap:12px;flex-wrap:wrap}
   @media (max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}.wrap,.hdr,.foot{padding-left:18px;padding-right:18px}}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>storage.ae | Facility inspection, week ${weekNo(week)}</title><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet"><style>${css}</style></head><body>${body}</body></html>`;

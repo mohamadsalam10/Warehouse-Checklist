@@ -408,3 +408,16 @@ tr.today td{background:rgb(254 80 0 / 6%)}
   .wk-bar{gap:6px}
   .wk-label{flex:1 1 auto}
 }
+
+/* Work orders from failed points */
+.fx-card{border-left-width:4px}
+.fx-card.sev-critical{border-left-color:var(--danger)}
+.fx-card.sev-major{border-left-color:var(--warning)}
+.fx-card.sev-minor{border-left-color:var(--neutral)}
+.fx-card .wh-meta{line-height:1.4}
+.ok-t{color:var(--success);font-weight:600}
+.fixed-box{margin-top:20px;padding:16px;background:var(--surface-2);border-left:3px solid var(--fg)}
+.fx-li{border-left:3px solid var(--success)!important}
+.ba-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+.ba-l{display:block;font-weight:700;font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+@media (max-width:640px){.ba-grid{grid-template-columns:1fr}}

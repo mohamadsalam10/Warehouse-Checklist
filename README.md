@@ -118,3 +118,14 @@ Open http://localhost:3000.
 - **Records** are in the **Cleaning** tab (admins): filter by dates, cleaner, warehouse and status (Done, In progress, Not started, Not finished, Missed).
   There is no cleaning email.
 - Work orders are created when anyone opens the app; if nobody does for a while, up to 14 days are filled in the next time someone does.
+
+## Work orders (fixing failed points)
+- When an inspection is submitted, **every failed point becomes a work order** for that warehouse, shown in the **Work orders** tab
+  (supervisors see their own warehouses; admins see all).
+- **No duplicates:** if the same point fails again while its work order is still open, that order is updated (latest week, times reported,
+  newest note and any new photos). A new order is only opened once the previous one has been fixed.
+- If a later inspection marks the point Pass, the open order says so, so the supervisor can close it.
+- To close one: optionally add a note and "after" photos, then **Mark as fixed**. Fixed orders can be reopened.
+- The weekly report shows, under each warehouse's score and fails, **What was fixed this week** (with before and after photos)
+  and how many work orders are still open.
+- All dates and weeks follow Dubai time (`APP_TIMEZONE`, default `Asia/Dubai`), whatever time zone the server or phone uses.

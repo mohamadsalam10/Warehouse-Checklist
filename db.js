@@ -100,6 +100,36 @@ async function init() {
     );
     CREATE INDEX IF NOT EXISTS cleaning_jobs_date ON cleaning_jobs (job_date);
   `);
+  // Work orders raised from failed inspection points (one open order per warehouse + point)
+  await q(`
+    CREATE TABLE IF NOT EXISTS issues (
+      id SERIAL PRIMARY KEY,
+      warehouse_id TEXT NOT NULL,
+      warehouse_name TEXT NOT NULL,
+      point_id TEXT NOT NULL,
+      point_text TEXT NOT NULL,
+      section_title TEXT NOT NULL DEFAULT '',
+      point_group TEXT NOT NULL DEFAULT '',
+      category TEXT NOT NULL DEFAULT '',
+      action TEXT NOT NULL DEFAULT '',
+      severity TEXT NOT NULL DEFAULT 'major',
+      first_week TEXT NOT NULL,
+      last_week TEXT NOT NULL,
+      times_reported INTEGER NOT NULL DEFAULT 1,
+      passed_week TEXT,
+      first_note TEXT NOT NULL DEFAULT '',
+      last_note TEXT NOT NULL DEFAULT '',
+      before_photos JSONB NOT NULL DEFAULT '[]'::jsonb,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','fixed')),
+      fix_note TEXT NOT NULL DEFAULT '',
+      after_photos JSONB NOT NULL DEFAULT '[]'::jsonb,
+      fixed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      fixed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS issues_wh_status ON issues (warehouse_id, status);
+  `);
   await q(`DELETE FROM sessions WHERE expires_at < now()`);
 }
 
